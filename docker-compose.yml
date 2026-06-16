@@ -1,0 +1,9 @@
+services:
+  better-bot:
+    image: ghcr.io/shubhamwagh/better-booking-bot:latest
+    restart: unless-stopped
+    env_file: .env
+    entrypoint: ["python", "-m", "better_bot.daemon"]
+    volumes:
+      # Optional: mount your own config.yaml to customise targets
+      - ./config.yaml:/app/config.yaml:ro
