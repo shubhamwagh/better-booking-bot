@@ -36,6 +36,7 @@ class CardDetails:
     address2: str | None = None
     city: str | None = None
     postcode: str | None = None
+    save_card: bool = False
 
 
 def complete_checkout(
@@ -207,12 +208,12 @@ def _fill_saved_card_cvv(page: Page, cvv: str) -> None:
 def _fill_billing_details(page: Page, card: CardDetails) -> None:
     """Fill First name, Last name, Address, Town/city, Postcode for new card mode."""
     fields = [
-        (card.first_name, ['input[placeholder="First name"]', 'input[id*="first"], input[name*="first"]']),
-        (card.last_name,  ['input[placeholder="Last name"]',  'input[id*="last"],  input[name*="last"]']),
-        (card.address1,   ['input[placeholder="Address line 1"]', 'input[id*="address1"], input[name*="address1"]']),
-        (card.address2,   ['input[placeholder="Address line 2"]', 'input[id*="address2"], input[name*="address2"]']),
-        (card.city,       ['input[placeholder="Town/city"]', 'input[id*="city"], input[name*="city"]', 'input[placeholder*="Town"]']),
-        (card.postcode,   ['input[placeholder="Postcode"]',  'input[id*="post"], input[name*="post"]']),
+        (card.first_name, ['input[id="billingFirstName"]',       'input[name="billingFirstName"]']),
+        (card.last_name,  ['input[id="billingLastName"]',        'input[name="billingLastName"]']),
+        (card.address1,   ['input[name="billingAddressLineOne"]', 'input[id="billingAddressLineOne"]']),
+        (card.address2,   ['input[id="billingAddressLineTwo"]',  'input[name="billingAddressLineTwo"]']),
+        (card.city,       ['input[id="billingAddressCity"]',     'input[name="billingCity"]']),
+        (card.postcode,   ['input[id="billingAddressPostcode"]', 'input[name="billingPostcode"]']),
     ]
     for value, selectors in fields:
         if not value:
@@ -273,6 +274,16 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
         'iframe#payment-iframe, iframe[src*="opayo"], iframe[src*="elavon"], iframe[src*="pi."], iframe:not([src="about:blank"])'
     )
 
+    cardholder_name = " ".join(filter(None, [card.first_name, card.last_name])) or None
+    if cardholder_name:
+        _type_in_frame(opayo, cardholder_name, [
+            'input[name="cardholder-name"]',
+            'input[id="cardholder-name"]',
+            'input[autocomplete="cc-name"]',
+            'input[placeholder*="Name"]',
+            'input[placeholder*="name"]',
+        ], "cardholder name")
+
     if card.number:
         _type_in_frame(opayo, card.number, [
             'input[name="card-number"]',
@@ -293,6 +304,15 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
         'input[autocomplete="cc-csc"]',
         'input[placeholder*="CV"]',
     ], "CVV")
+
+    if card.save_card:
+        try:
+            cb = page.locator('input[name="saveCard"]').first
+            if cb.is_visible(timeout=3_000) and not cb.is_checked():
+                cb.check()
+                log.debug("'Save card' checkbox checked")
+        except Exception:
+            pass
 
 
 def _find_opayo_frame(page: Page) -> Frame | None:

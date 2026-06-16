@@ -217,6 +217,7 @@ def main() -> None:
         address2=os.getenv("BILLING_ADDRESS2"),
         city=os.getenv("BILLING_CITY"),
         postcode=os.getenv("BILLING_POSTCODE"),
+        save_card=os.getenv("SAVE_CARD", "false").lower() in ("1", "true", "yes"),
     )
     log.info(f"Payment mode: {'new card' if card_number else 'saved card'}")
 
