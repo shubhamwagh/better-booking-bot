@@ -1,14 +1,14 @@
 """Playwright-based checkout flow.
 
 Handles Opayo payment via three modes:
-  - credit only: full balance covered by account credit — no card entry needed.
+  - credit only: full balance covered by account credit - no card entry needed.
   - saved card:  radio already selected, inject CVV only.
   - new card:    click "Pay with a different card", fill number + expiry + CVV.
 
 Credit is auto-applied by Better's checkout page; partial credit reduces the
 total and the remainder is charged to the card as normal.
 
-Only this module needs a browser — everything else is pure API.
+Only this module needs a browser - everything else is pure API.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class CardDetails(BaseModel):
     cvv: str
     number: str | None = None     # set to use new-card mode
     expiry: str | None = None     # MM/YY or MM/YYYY
-    # Billing address — required for new card mode
+    # Billing address - required for new card mode
     first_name: str | None = None
     last_name: str | None = None
     address1: str | None = None
@@ -105,15 +105,15 @@ def complete_checkout(
 
             # Step 2: detect payment mode from page
             if _is_zero_balance(page):
-                log.info("Credit covers full balance — no card entry needed")
+                log.info("Credit covers full balance - no card entry needed")
             elif _has_saved_card(page):
-                log.info("Saved card detected — selecting saved card and filling CVV")
+                log.info("Saved card detected - selecting saved card and filling CVV")
                 if not card.cvv:
                     raise RuntimeError("CARD_CVV required for saved card checkout but not set")
                 _select_saved_card(page)
                 _fill_saved_card_cvv(page, card.cvv)
             else:
-                log.info("No saved card — entering new card details")
+                log.info("No saved card - entering new card details")
                 if not card.number or not card.expiry:
                     raise RuntimeError(
                         "No saved card found. Set CARD_NUMBER and CARD_EXPIRY in .env for new card mode"
@@ -222,7 +222,7 @@ def _select_saved_card(page: Page) -> None:
                 return
         except Exception:
             continue
-    log.debug("Saved card radio not found — assuming already selected")
+    log.debug("Saved card radio not found - assuming already selected")
 
 
 def _fill_saved_card_cvv(page: Page, cvv: str) -> None:
@@ -276,7 +276,7 @@ def _select_new_card(page: Page) -> None:
     """Click the 'Pay with a different card' radio/button.
 
     If no such radio exists (new user with no saved card), the card form is
-    already showing — log and continue.
+    already showing - log and continue.
     """
     for selector in [
         'label:has-text("Pay with a different card")',
@@ -292,7 +292,7 @@ def _select_new_card(page: Page) -> None:
             return
         except Exception:
             continue
-    log.debug("'Pay with a different card' radio not found — assuming card form already visible")
+    log.debug("'Pay with a different card' radio not found - assuming card form already visible")
 
 
 def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
@@ -484,13 +484,13 @@ def _accept_terms_inline(page: Page) -> None:
                 return
         except Exception:
             continue
-    log.debug("T&Cs inline checkbox not found — may already be accepted")
+    log.debug("T&Cs inline checkbox not found - may already be accepted")
 
 
 def _accept_terms(page: Page) -> None:
     """Click 'I Agree' on T&Cs modal, or check T&Cs checkbox if present."""
     # Modal with "I Agree" button (appears after clicking Continue)
-    # We pre-click Continue then handle modal — but better to handle before.
+    # We pre-click Continue then handle modal - but better to handle before.
     # The modal may appear on page load; try to dismiss it first.
     try:
         btn = page.locator('button:has-text("I Agree")').first
@@ -534,7 +534,7 @@ def _accept_terms(page: Page) -> None:
 
 def _block_analytics(page: Page) -> None:
     # Block OneTrust cookie banner CDN only.
-    # Do NOT block GTM — the Better SPA uses a GTM event to trigger Opayo initialization.
+    # Do NOT block GTM - the Better SPA uses a GTM event to trigger Opayo initialization.
     page.route("**/cdn.cookielaw.org/**", lambda r: r.abort())
 
 

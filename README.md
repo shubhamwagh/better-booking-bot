@@ -2,7 +2,7 @@
 
 Automated activity booking bot for [Better (GLL)](https://www.better.org.uk) leisure centres.
 
-Monitors slot availability, applies account credit, and completes payment automatically — via saved card, new card, or credit-only.
+Monitors slot availability, applies account credit, and completes payment automatically - via saved card, new card, or credit-only.
 
 ## Quick start (Docker)
 
@@ -14,11 +14,11 @@ docker compose up -d          # runs as daemon, self-schedules from config.yaml
 docker compose logs -f        # watch logs
 ```
 
-The image is pre-built and published to GHCR — no build step needed.
+The image is pre-built and published to GHCR - no build step needed.
 
 ## Configuration
 
-### Credentials — `.env`
+### Credentials - `.env`
 
 ```bash
 BETTER_USERNAME=your@email.com
@@ -41,7 +41,7 @@ CARD_CVV=123
 # BILLING_POSTCODE=OX1 1AA
 ```
 
-### Booking targets — `config.yaml`
+### Booking targets - `config.yaml`
 
 ```yaml
 targets:

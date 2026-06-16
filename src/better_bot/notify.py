@@ -1,4 +1,4 @@
-"""Notification helper — logs to stdout."""
+"""Notification helper - logs to stdout."""
 
 from __future__ import annotations
 
