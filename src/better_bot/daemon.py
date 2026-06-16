@@ -54,6 +54,13 @@ def main() -> None:
         cvv=cvv,
         number=os.getenv("CARD_NUMBER"),
         expiry=os.getenv("CARD_EXPIRY"),
+        first_name=os.getenv("BILLING_FIRST_NAME"),
+        last_name=os.getenv("BILLING_LAST_NAME"),
+        address1=os.getenv("BILLING_ADDRESS1"),
+        address2=os.getenv("BILLING_ADDRESS2"),
+        city=os.getenv("BILLING_CITY"),
+        postcode=os.getenv("BILLING_POSTCODE"),
+        save_card=os.getenv("SAVE_CARD", "false").lower() in ("1", "true", "yes"),
     )
 
     config_path = Path(args.config or os.getenv("CONFIG_PATH", "config.yaml"))
