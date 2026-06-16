@@ -76,19 +76,9 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
         cart_item = api.cart_add(slot, occurrence)
         log.info(f"Added to cart: {cart_item.name}  £{cart_item.price_pence / 100:.2f}")
 
-        # 5. Check available credit — use it fully, pay remainder by card
-        cart_state = api.get_cart()
-        available_credit = cart_state.get("credits", {}).get("general", {}).get("total_available", 0)
-        balance = cart_state.get("balance", cart_item.price_pence)
-        credit_only = available_credit >= balance
-        if credit_only:
-            log.info(f"Credit covers full balance (£{balance / 100:.2f}) — no card payment needed")
-        elif available_credit > 0:
-            log.info(f"Partial credit £{available_credit / 100:.2f} applied — paying remainder £{(balance - available_credit) / 100:.2f} by card")
-
-        # 6. Complete checkout (Playwright + Opayo CVV)
+        # 5. Complete checkout — auto-detects credit/saved-card/new-card from page
         try:
-            ref = complete_checkout(card=card, token=token, headless=headless, credit_only=credit_only)
+            ref = complete_checkout(card=card, token=token, headless=headless)
             log.info(f"Booking complete: {ref}")
             notify(
                 subject=f"Booked: {name}",
