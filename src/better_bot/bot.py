@@ -1,8 +1,8 @@
 """better-booking-bot — main orchestrator.
 
 Usage:
-    uv run bot.py --target "Abingdon Pickleball Monday 19:30"
-    uv run bot.py --list
+    uv run -m better_bot.bot --target "Abingdon Pickleball Monday 19:30"
+    uv run -m better_bot.bot --list
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-from api import BetterAPI, BetterAPIError, Slot
-from checkout import CardDetails, complete_checkout
-from notify import send as notify
+from better_bot.api import BetterAPI, BetterAPIError, Slot
+from better_bot.checkout import CardDetails, complete_checkout
+from better_bot.notify import send as notify
 
 log = logging.getLogger(__name__)
 
@@ -57,13 +57,13 @@ def run_target(target: dict, username: str, password: str, card: CardDetails) ->
         token = api._token  # noqa: SLF001  — needed for checkout browser session
         api.fetch_membership_user_id()
 
-        # 2. Pre-warm: navigate to activity page, poll until slot opens
+        # 2. Poll until slot opens
         slot = _wait_for_slot(api, venue, activity, session_date, target_time, release_hour)
 
         if slot is None:
             log.error("%s: no bookable slot found for %s %s", name, session_date, target_time)
             notify(
-                subject=f"❌ No slot: {name}",
+                subject=f"No slot: {name}",
                 body=f"No bookable slot found for {name} on {session_date} at {target_time}.",
             )
             return
@@ -81,7 +81,7 @@ def run_target(target: dict, username: str, password: str, card: CardDetails) ->
             ref = complete_checkout(card=card, token=token)
             log.info("Booking complete: %s", ref)
             notify(
-                subject=f"✅ Booked: {name}",
+                subject=f"Booked: {name}",
                 body=(
                     f"Booking confirmed!\n\n"
                     f"Activity: {name}\n"
@@ -91,14 +91,13 @@ def run_target(target: dict, username: str, password: str, card: CardDetails) ->
                 ),
             )
         except Exception as exc:
-            # Remove from cart to avoid stale item
             try:
                 api.cart_remove(cart_item.cart_item_id)
             except Exception:
                 pass
             log.error("Checkout failed: %s", exc)
             notify(
-                subject=f"❌ Booking failed: {name}",
+                subject=f"Booking failed: {name}",
                 body=f"Checkout failed for {name} on {session_date} {target_time}.\n\nError: {exc}",
             )
             raise
@@ -108,9 +107,9 @@ def run_target(target: dict, username: str, password: str, card: CardDetails) ->
 # Slot polling
 # ------------------------------------------------------------------
 
-POLL_INTERVAL_S = 2      # seconds between polls once we're at release time
-PRE_RELEASE_POLL_S = 10  # seconds between polls before release time
-MAX_WAIT_S = 300         # give up after 5 minutes post-release
+POLL_INTERVAL_S = 2
+PRE_RELEASE_POLL_S = 10
+MAX_WAIT_S = 300
 
 
 def _wait_for_slot(
@@ -182,7 +181,6 @@ def main() -> None:
             print(f"  [{status}] {t['name']}  ({t['venue_slug']}/{t['activity_slug']} @ {t['target_time']})")
         return
 
-    # Credentials
     username = os.environ["BETTER_USERNAME"]
     password = os.environ["BETTER_PASSWORD"]
     cvv = os.getenv("CARD_CVV")
@@ -203,10 +201,8 @@ def main() -> None:
         sys.exit(1)
 
     card = CardDetails(cvv=cvv, number=card_number, expiry=card_expiry)
-    mode = "new card" if card_number else "saved card"
-    log.info("Payment mode: %s", mode)
+    log.info("Payment mode: %s", "new card" if card_number else "saved card")
 
-    # Select target(s)
     enabled = [t for t in targets if t.get("enabled", True)]
 
     if args.target:
@@ -233,7 +229,6 @@ def main() -> None:
 
 
 def _dry_run(target: dict, username: str, password: str) -> None:
-    from datetime import timedelta
     session_date = date.today() + timedelta(days=int(target.get("days_ahead", 7)))
     log.info("[DRY RUN] %s — checking slots for %s @ %s", target["name"], session_date, target["target_time"])
     with BetterAPI() as api:
