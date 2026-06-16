@@ -176,7 +176,7 @@ def _select_saved_card(page: Page) -> None:
             if el.is_visible(timeout=3_000):
                 el.click()
                 time.sleep(1)
-                log.debug("Selected saved card via %s", selector)
+                log.debug(f"Selected saved card via {selector}")
                 return
         except Exception:
             continue
@@ -231,21 +231,26 @@ def _fill_billing_details(page: Page, card: CardDetails) -> None:
 
 
 def _select_new_card(page: Page) -> None:
-    """Click the 'Pay with a different card' radio/button."""
+    """Click the 'Pay with a different card' radio/button.
+
+    If no such radio exists (new user with no saved card), the card form is
+    already showing — log and continue.
+    """
     for selector in [
         'label:has-text("Pay with a different card")',
         'input[value*="different"]',
+        'input[id="new-card"]',
         'button:has-text("different card")',
         '[data-testid*="new-card"]',
     ]:
         try:
             page.click(selector, timeout=5_000)
             time.sleep(1)
-            log.debug("Selected new card via %s", selector)
+            log.debug(f"Selected new card via {selector}")
             return
         except Exception:
             continue
-    raise RuntimeError("Could not find 'Pay with a different card' option on checkout page")
+    log.debug("'Pay with a different card' radio not found — assuming card form already visible")
 
 
 def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
