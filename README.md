@@ -4,6 +4,12 @@ Automated activity booking bot for [Better (GLL)](https://www.better.org.uk) lei
 
 Monitors slot availability, applies account credit, and completes payment automatically - via saved card, new card, or credit-only.
 
+> **WARNING:** This tool automates real payments using your Better account credentials and card details.
+> Use it at your own risk. The authors take no responsibility for unintended bookings or charges.
+>
+> **Never commit your `.env` file to Git or push it to GitHub.** It contains passwords and card details.
+> The `.gitignore` excludes `.env` by default - keep it that way.
+
 ## Quick start (Docker)
 
 ```bash
