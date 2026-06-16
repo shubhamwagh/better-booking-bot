@@ -13,7 +13,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from playwright.sync_api import Frame, Page, sync_playwright
+from playwright.sync_api import Frame, Page, expect, sync_playwright
 
 BOOKINGS_BASE = "https://bookings.better.org.uk"
 
@@ -27,7 +27,7 @@ class CardDetails:
     expiry: str | None = None   # MM/YY or MM/YYYY
 
 
-def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30) -> str:
+def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30, confirm: bool = False) -> str:
     """Navigate to checkout and complete payment.
 
     Args:
@@ -35,6 +35,7 @@ def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30) -> str
               Otherwise uses the pre-selected saved card (CVV only).
         token: Valid Better PASETO bearer token (from BetterAPI.login).
         timeout_s: Seconds to wait for booking confirmation.
+        confirm: If True, pause and require manual confirmation before clicking Pay.
 
     Returns:
         Booking reference string (e.g. "BET-XXXXXXXX").
@@ -43,9 +44,23 @@ def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30) -> str
         RuntimeError: If checkout does not complete within timeout_s.
     """
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         try:
-            context = browser.new_context()
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+            )
+            # Hide navigator.webdriver to bypass Opayo bot detection
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
             context.add_cookies([{
                 "name": "better.org.uk-authToken",
                 "value": f'"{token}"',
@@ -59,9 +74,9 @@ def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30) -> str
             _block_analytics(page)
 
             log.info("Navigating to checkout…")
-            page.goto(f"{BOOKINGS_BASE}/basket/checkout", wait_until="domcontentloaded", timeout=20_000)
+            page.goto(f"{BOOKINGS_BASE}/basket/checkout", wait_until="networkidle", timeout=30_000)
             _dismiss_cookie_banner(page)
-            time.sleep(3)
+            time.sleep(2)
 
             if card.number:
                 log.info("New card mode — selecting 'Pay with a different card'")
@@ -70,8 +85,14 @@ def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30) -> str
             log.info("Filling card details in Opayo iframe…")
             _fill_opayo_iframe(page, card)
 
+            # Accept T&Cs if present (required to enable Pay button)
+            _accept_terms(page)
+
+            log.info("Waiting for Pay button to enable…")
+            pay_btn = page.locator('button[aria-label="Pay now"], button:has-text("Pay now")').first
+            expect(pay_btn).to_be_enabled(timeout=30_000)
             log.info("Clicking Pay now…")
-            page.locator('button:has-text("Pay")').click(timeout=10_000)
+            pay_btn.click(timeout=10_000)
 
             log.info("Waiting for booking confirmation…")
             ref = _wait_for_confirmation(page, timeout_s)
@@ -105,42 +126,65 @@ def _select_new_card(page: Page) -> None:
 
 def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
     """Locate the Opayo iframe and fill the required fields."""
-    page.wait_for_selector("iframe", timeout=15_000)
+    # Wait for Opayo iframe src to be populated in the DOM, then use
+    # frame_locator (finds by element selector, handles frame load timing).
+    log.debug("Waiting for Opayo iframe src to populate...")
+    try:
+        page.wait_for_function(
+            "() => { const f = document.querySelector('iframe'); "
+            "return f && f.src && (f.src.includes('opayo') || f.src.includes('elavon')); }",
+            timeout=120_000,
+        )
+    except Exception as exc:
+        log.debug("wait_for_function timed out: %s", exc)
 
-    opayo_frame = _find_opayo_frame(page)
-    if opayo_frame is None:
-        raise RuntimeError("Opayo payment iframe not found on checkout page")
+    opayo = page.frame_locator(
+        'iframe#payment-iframe, iframe[src*="opayo"], iframe[src*="elavon"]'
+    )
 
     if card.number:
-        _fill_field(opayo_frame, card.number, [
+        _type_in_frame(opayo, card.number, [
             'input[name="card-number"]',
             'input[id="card-number"]',
             'input[autocomplete="cc-number"]',
-            'input[data-id="card-number"]',
         ], "card number")
 
     if card.expiry:
-        _fill_field(opayo_frame, card.expiry, [
+        _type_in_frame(opayo, card.expiry, [
             'input[name="expiry-date"]',
             'input[id="expiry-date"]',
             'input[autocomplete="cc-exp"]',
-            'input[data-id="expiry-date"]',
         ], "expiry")
 
-    _fill_field(opayo_frame, card.cvv, [
+    _type_in_frame(opayo, card.cvv, [
         'input[name="security-code"]',
         'input[id="security-code"]',
         'input[autocomplete="cc-csc"]',
         'input[placeholder*="CV"]',
-        'input[data-id="security-code"]',
     ], "CVV")
 
 
 def _find_opayo_frame(page: Page) -> Frame | None:
     for frame in page.frames:
-        if "opayo" in frame.url or "elavon" in frame.url:
+        url = frame.url
+        if url and url != "about:blank" and ("opayo" in url or "elavon" in url):
             return frame
     return None
+
+
+def _type_in_frame(frame_loc: any, value: str, selectors: list[str], label: str) -> None:
+    """Type value into first matching selector inside a frame_locator."""
+    for selector in selectors:
+        try:
+            loc = frame_loc.locator(selector).first
+            loc.wait_for(state="visible", timeout=30_000)
+            loc.click()
+            loc.type(value, delay=80)
+            log.debug("%s typed in frame via %s", label, selector)
+            return
+        except Exception:
+            continue
+    raise RuntimeError(f"Could not locate {label} field in Opayo iframe")
 
 
 def _fill_field(frame: Frame, value: str, selectors: list[str], label: str) -> None:
@@ -149,6 +193,20 @@ def _fill_field(frame: Frame, value: str, selectors: list[str], label: str) -> N
             frame.wait_for_selector(selector, timeout=5_000)
             frame.fill(selector, value)
             log.debug("%s filled via selector %s", label, selector)
+            return
+        except Exception:
+            continue
+    raise RuntimeError(f"Could not locate {label} field in Opayo iframe")
+
+
+def _type_field(frame: Frame, value: str, selectors: list[str], label: str) -> None:
+    """Like _fill_field but uses type() to simulate real keypresses (needed for CVV)."""
+    for selector in selectors:
+        try:
+            frame.wait_for_selector(selector, timeout=5_000)
+            frame.click(selector)
+            frame.type(selector, value, delay=80)
+            log.debug("%s typed via selector %s", label, selector)
             return
         except Exception:
             continue
@@ -204,10 +262,37 @@ def _extract_reference(page: Page) -> str:
 # Page helpers
 # ------------------------------------------------------------------
 
+def _accept_terms(page: Page) -> None:
+    """Check the T&Cs checkbox if present and unchecked."""
+    for selector in [
+        'input[type="checkbox"][id*="terms"]',
+        'input[type="checkbox"][name*="terms"]',
+        'input[type="checkbox"][aria-label*="Terms"]',
+        'label:has-text("Terms and Conditions") input[type="checkbox"]',
+        '[data-testid*="terms"] input',
+    ]:
+        try:
+            cb = page.locator(selector).first
+            if cb.is_visible(timeout=2_000) and not cb.is_checked():
+                cb.check()
+                log.debug("T&Cs accepted via %s", selector)
+                return
+        except Exception:
+            continue
+    # Try clicking the label as fallback
+    try:
+        label = page.locator('label:has-text("Terms and Conditions")').first
+        if label.is_visible(timeout=2_000):
+            label.click()
+            log.debug("T&Cs accepted via label click")
+    except Exception:
+        pass
+
+
 def _block_analytics(page: Page) -> None:
+    # Block OneTrust cookie banner CDN only.
+    # Do NOT block GTM — the Better SPA uses a GTM event to trigger Opayo initialization.
     page.route("**/cdn.cookielaw.org/**", lambda r: r.abort())
-    page.route("**/googletagmanager.com/**", lambda r: r.abort())
-    page.route("**/analytics.google.com/**", lambda r: r.abort())
 
 
 def _dismiss_cookie_banner(page: Page) -> None:
