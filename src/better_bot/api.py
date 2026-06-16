@@ -7,11 +7,11 @@ No business logic — just raw API wrappers.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 import httpx
+from pydantic import BaseModel
 
 BASE_URL = "https://better-admin.org.uk/api"
 ORIGIN = "https://bookings.better.org.uk"
@@ -19,8 +19,7 @@ ORIGIN = "https://bookings.better.org.uk"
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class Slot:
+class Slot(BaseModel):
     id: str
     starts_at: str  # "HH:MM" 24-hour
     status: str     # "BOOK" | "FULL" | ...
@@ -28,14 +27,12 @@ class Slot:
     composite_key: str
 
 
-@dataclass
-class OccurrenceDetails:
+class OccurrenceDetails(BaseModel):
     ticket_id: str
     pricing_option_id: int
 
 
-@dataclass
-class CartItem:
+class CartItem(BaseModel):
     cart_item_id: int
     name: str
     price_pence: int
