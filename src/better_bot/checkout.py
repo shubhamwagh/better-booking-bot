@@ -40,27 +40,28 @@ class CardDetails:
 
 
 def complete_checkout(
-    card: CardDetails | None,
+    card: CardDetails,
     token: str,
     timeout_s: int = 30,
     confirm: bool = False,
     headless: bool = True,
-    credit_only: bool = False,
 ) -> str:
     """Navigate to checkout and complete payment.
 
+    Auto-detects payment mode from the page:
+      1. Applies any available account credit.
+      2. If total drops to £0 → confirms without card entry.
+      3. Else if saved card radio present → saved card mode (CVV only).
+      4. Else → new card mode (billing details + full card).
+
     Args:
-        card: Card details. If card.number is set, enters a new card.
-              Otherwise uses the pre-selected saved card (CVV only).
-              May be None when credit_only=True.
+        card: Card credentials. For saved card mode only cvv is needed.
+              For new card mode also number, expiry, and billing fields.
         token: Valid Better PASETO bearer token (from BetterAPI.login).
         timeout_s: Seconds to wait for booking confirmation.
-        confirm: If True, pause and require manual confirmation before clicking Pay.
-        credit_only: If True, account credit covers the full balance — skip all
-                     card/CVV entry and just confirm the booking.
 
     Returns:
-        Booking reference string (e.g. "BET-XXXXXXXX").
+        Booking reference URL or ID.
 
     Raises:
         RuntimeError: If checkout does not complete within timeout_s.
@@ -100,25 +101,29 @@ def complete_checkout(
             _dismiss_cookie_banner(page)
             time.sleep(2)
 
-            if credit_only:
-                log.info("Credit-only mode — applying full credit balance")
-                _apply_full_credit(page)
-            elif card is not None and card.number:
-                log.info("New card mode — applying any available credit then selecting new card")
-                _apply_full_credit(page)
-                _select_new_card(page)
-                log.info("New card mode — filling billing details…")
-                _fill_billing_details(page, card)
-                log.info("New card mode — filling Opayo iframe…")
-                _fill_opayo_iframe(page, card)
-            else:
-                log.info("Saved card mode — applying any available credit then filling CVV")
-                _apply_full_credit(page)
-                _select_saved_card(page)
-                log.info("Saved card mode — filling CVV textbox…")
-                _fill_saved_card_cvv(page, card.cvv)  # type: ignore[union-attr]
+            # Step 1: apply any available credit
+            _apply_full_credit(page)
 
-            # Check inline T&Cs checkbox before clicking pay (it's on the page, not a post-click modal)
+            # Step 2: detect payment mode from page
+            if _is_zero_balance(page):
+                log.info("Credit covers full balance — no card entry needed")
+            elif _has_saved_card(page):
+                log.info("Saved card detected — selecting saved card and filling CVV")
+                if not card.cvv:
+                    raise RuntimeError("CARD_CVV required for saved card checkout but not set")
+                _select_saved_card(page)
+                _fill_saved_card_cvv(page, card.cvv)
+            else:
+                log.info("No saved card — entering new card details")
+                if not card.number or not card.expiry:
+                    raise RuntimeError(
+                        "No saved card found. Set CARD_NUMBER and CARD_EXPIRY in .env for new card mode"
+                    )
+                _select_new_card(page)
+                _fill_billing_details(page, card)
+                _fill_opayo_iframe(page, card)
+
+            # Step 3: accept T&Cs and pay
             _accept_terms_inline(page)
 
             log.info("Clicking Pay / Continue…")
@@ -143,6 +148,44 @@ def complete_checkout(
 # ------------------------------------------------------------------
 # Credit helpers
 # ------------------------------------------------------------------
+
+def _is_zero_balance(page: Page) -> bool:
+    """Return True if the total to pay is £0 after credit was applied."""
+    try:
+        text = page.locator('button:has-text("Pay £0"), button:has-text("Pay £0.00")').first
+        if text.is_visible(timeout=2_000):
+            return True
+    except Exception:
+        pass
+    # Fallback: parse summary total from page text
+    try:
+        total = page.evaluate("""
+            () => {
+                const els = [...document.querySelectorAll('*')];
+                for (const el of els) {
+                    if (el.children.length === 0 && /Total to pay/i.test(el.textContent)) {
+                        const next = el.nextElementSibling;
+                        if (next) return next.textContent.trim();
+                    }
+                }
+                return null;
+            }
+        """)
+        if total and "0.00" in total:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _has_saved_card(page: Page) -> bool:
+    """Return True if a saved card radio button is visible on the checkout page."""
+    try:
+        radio = page.locator('input[id="saved-card"], input[value="saved_card"]').first
+        return radio.is_visible(timeout=3_000)
+    except Exception:
+        return False
+
 
 def _apply_full_credit(page: Page) -> None:
     """Click 'Use full credit balance' and wait for the page to update."""
