@@ -1,4 +1,4 @@
-"""Daemon mode — long-running scheduler.
+"""Daemon mode - long-running scheduler.
 
 Reads config.yaml and schedules all enabled targets using their cron fields.
 Watches config.yaml every CONFIG_POLL_S seconds; adds/removes jobs live
@@ -35,14 +35,14 @@ CONFIG_POLL_S = 30
 # ------------------------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Better booking bot — daemon scheduler")
+    p = argparse.ArgumentParser(description="Better booking bot - daemon scheduler")
     p.add_argument("--config", default=None)
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
 
     load_dotenv()
@@ -76,7 +76,7 @@ def main() -> None:
         while True:
             mtime = config_path.stat().st_mtime
             if mtime != last_mtime:
-                log.info("Config changed — reloading %s", config_path)
+                log.info("Config changed - reloading %s", config_path)
                 current_job_ids = _sync_jobs(
                     scheduler, config_path, current_job_ids,
                     username, password, card,
@@ -141,7 +141,7 @@ def _add_job(
 ) -> None:
     cron = target.get("cron")
     if not cron:
-        log.warning("Target '%s' has no cron field — skipping", target["name"])
+        log.warning("Target '%s' has no cron field - skipping", target["name"])
         return
 
     try:

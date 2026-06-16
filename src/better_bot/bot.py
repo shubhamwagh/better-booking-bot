@@ -1,4 +1,4 @@
-"""better-booking-bot — main orchestrator.
+"""better-booking-bot - main orchestrator.
 
 Usage:
     uv run -m better_bot.bot --target "Abingdon Pickleball Monday 19:30"
@@ -54,7 +54,7 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
     with BetterAPI() as api:
         # 1. Login
         api.login(username, password)
-        token = api._token  # noqa: SLF001  — needed for checkout browser session
+        token = api._token  # noqa: SLF001  - needed for checkout browser session
         api.fetch_membership_user_id()
 
         # 2. Poll until slot opens
@@ -76,7 +76,7 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
         cart_item = api.cart_add(slot, occurrence)
         log.info(f"Added to cart: {cart_item.name}  £{cart_item.price_pence / 100:.2f}")
 
-        # 5. Complete checkout — auto-detects credit/saved-card/new-card from page
+        # 5. Complete checkout - auto-detects credit/saved-card/new-card from page
         try:
             ref = complete_checkout(card=card, token=token, headless=headless)
             log.info(f"Booking complete: {ref}")
@@ -131,7 +131,7 @@ def _wait_for_slot(
         try:
             slots = api.get_slots(venue, activity, session_date)
         except BetterAPIError as exc:
-            log.warning(f"Slot poll error: {exc} — retrying")
+            log.warning(f"Slot poll error: {exc} - retrying")
             time.sleep(POLL_INTERVAL_S)
             continue
 
@@ -140,10 +140,10 @@ def _wait_for_slot(
             return bookable[0]
 
         if not at_release:
-            log.debug(f"Pre-release — waiting {PRE_RELEASE_POLL_S}s before next poll")
+            log.debug(f"Pre-release - waiting {PRE_RELEASE_POLL_S}s before next poll")
             time.sleep(PRE_RELEASE_POLL_S)
         else:
-            log.debug(f"Slot not yet available — polling in {POLL_INTERVAL_S}s")
+            log.debug(f"Slot not yet available - polling in {POLL_INTERVAL_S}s")
             time.sleep(POLL_INTERVAL_S)
 
     return None
@@ -169,7 +169,7 @@ def main() -> None:
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
 
     load_dotenv()
@@ -191,7 +191,7 @@ def main() -> None:
     # CVV is needed for card payment; may be absent if user always has enough credit.
     # We allow it to be unset but will fail at checkout if card payment is actually required.
     if not cvv and not card_number:
-        log.warning("CARD_CVV not set — will only work if account credit covers the full booking cost")
+        log.warning("CARD_CVV not set - will only work if account credit covers the full booking cost")
 
     if card_number and not card_expiry:
         print("Error: CARD_NUMBER set but CARD_EXPIRY missing in .env", file=sys.stderr)
@@ -224,7 +224,7 @@ def main() -> None:
         sys.exit(1)
 
     if args.dry_run:
-        log.info("Dry-run mode — will not complete checkout")
+        log.info("Dry-run mode - will not complete checkout")
 
     for target in enabled:
         if args.dry_run:
@@ -238,7 +238,7 @@ def main() -> None:
 
 def _dry_run(target: dict, username: str, password: str) -> None:
     session_date = date.today() + timedelta(days=int(target.get("days_ahead", 7)))
-    log.info(f"[DRY RUN] {target['name']} — checking slots for {session_date} @ {target['target_time']}")
+    log.info(f"[DRY RUN] {target['name']} - checking slots for {session_date} @ {target['target_time']}")
     with BetterAPI() as api:
         api.login(username, password)
         api.fetch_membership_user_id()

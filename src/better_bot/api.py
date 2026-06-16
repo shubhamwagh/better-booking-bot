@@ -1,7 +1,7 @@
 """Better (GLL) API client.
 
 All network calls to better-admin.org.uk live here.
-No business logic — just raw API wrappers.
+No business logic - just raw API wrappers.
 """
 
 from __future__ import annotations
