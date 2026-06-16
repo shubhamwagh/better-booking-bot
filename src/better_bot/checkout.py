@@ -15,17 +15,16 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 
 from playwright.sync_api import Frame, Page, expect, sync_playwright
+from pydantic import BaseModel
 
 BOOKINGS_BASE = "https://bookings.better.org.uk"
 
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class CardDetails:
+class CardDetails(BaseModel):
     cvv: str
     number: str | None = None     # set to use new-card mode
     expiry: str | None = None     # MM/YY or MM/YYYY
