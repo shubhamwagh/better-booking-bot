@@ -1,0 +1,16 @@
+[Unit]
+Description=Better booking bot — %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=better-bot
+WorkingDirectory=/opt/better-booking-bot
+ExecStart=/opt/better-booking-bot/.venv/bin/python bot.py --target %i
+EnvironmentFile=/opt/better-booking-bot/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

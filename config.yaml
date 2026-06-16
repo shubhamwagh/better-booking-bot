@@ -1,0 +1,22 @@
+# better-booking-bot configuration
+# Each target defines one booking slot to auto-grab.
+# The bot runs shortly before release_time and polls until the slot opens.
+
+targets:
+  - name: "Abingdon Pickleball Monday 19:30"
+    venue_slug: "white-horse-leisure-and-tennis-centre"
+    activity_slug: "pickleball-drop-in"
+    target_time: "19:30"          # 24h time of the session to book
+    days_ahead: 7                 # slots open this many days before session
+    release_hour: 21              # local hour slots are released (21:00)
+    cron: "57 20 * * 1"          # fire at 20:57 Monday (pre-warm)
+    enabled: true
+
+  - name: "Didcot Pickleball Saturday 10:30"
+    venue_slug: "didcot-leisure-centre"
+    activity_slug: "pickleball-drop-in"
+    target_time: "10:30"
+    days_ahead: 7
+    release_hour: 21
+    cron: "57 20 * * 6"          # fire at 20:57 Saturday
+    enabled: true
