@@ -5,8 +5,8 @@ Watches config.yaml every CONFIG_POLL_S seconds; adds/removes jobs live
 when targets are added, removed, or toggled without restarting.
 
 Usage:
-    uv run daemon.py
-    uv run daemon.py --config /path/to/config.yaml
+    uv run -m better_bot.daemon
+    uv run -m better_bot.daemon --config /path/to/config.yaml
 """
 
 from __future__ import annotations
@@ -22,12 +22,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
-from bot import run_target
-from checkout import CardDetails
+from better_bot.bot import run_target
+from better_bot.checkout import CardDetails
 
 log = logging.getLogger(__name__)
 
-CONFIG_POLL_S = 30   # how often to check config.yaml for changes
+CONFIG_POLL_S = 30
 
 
 # ------------------------------------------------------------------
@@ -62,7 +62,6 @@ def main() -> None:
     scheduler.start()
     log.info("Scheduler started (timezone=Europe/London)")
 
-    # Track last-seen config so we only reload on actual changes
     last_mtime: float = 0.0
     current_job_ids: set[str] = set()
 
@@ -78,7 +77,7 @@ def main() -> None:
                 last_mtime = mtime
             time.sleep(CONFIG_POLL_S)
     except KeyboardInterrupt:
-        log.info("Shutting down…")
+        log.info("Shutting down...")
     finally:
         scheduler.shutdown()
 
@@ -95,7 +94,6 @@ def _sync_jobs(
     password: str,
     card: CardDetails,
 ) -> set[str]:
-    """Diff config targets against running jobs; add/remove as needed."""
     try:
         with config_path.open() as f:
             data = yaml.safe_load(f)
@@ -116,7 +114,6 @@ def _sync_jobs(
         if job_id not in existing_ids:
             _add_job(scheduler, job_id, target, username, password, card)
 
-    # Remove jobs for targets that were deleted or disabled
     for old_id in existing_ids - desired_ids:
         try:
             scheduler.remove_job(old_id)
@@ -153,7 +150,7 @@ def _add_job(
         name=target["name"],
         args=[target, username, password, card],
         replace_existing=True,
-        misfire_grace_time=120,   # allow up to 2-min late fire
+        misfire_grace_time=120,
     )
     log.info("Scheduled '%s'  cron='%s'", target["name"], cron)
 
