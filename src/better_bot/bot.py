@@ -40,7 +40,7 @@ def load_config(path: str | None = None) -> list[dict]:
 # Core booking flow
 # ------------------------------------------------------------------
 
-def run_target(target: dict, username: str, password: str, card: CardDetails) -> None:
+def run_target(target: dict, username: str, password: str, card: CardDetails, headless: bool = True) -> None:
     name = target["name"]
     venue = target["venue_slug"]
     activity = target["activity_slug"]
@@ -49,7 +49,7 @@ def run_target(target: dict, username: str, password: str, card: CardDetails) ->
     release_hour = int(target.get("release_hour", 21))
 
     session_date = date.today() + timedelta(days=days_ahead)
-    log.info("Target: %s | Date: %s | Time: %s", name, session_date, target_time)
+    log.info(f"Target: {name} | Date: {session_date} | Time: {target_time}")
 
     with BetterAPI() as api:
         # 1. Login
@@ -61,7 +61,7 @@ def run_target(target: dict, username: str, password: str, card: CardDetails) ->
         slot = _wait_for_slot(api, venue, activity, session_date, target_time, release_hour)
 
         if slot is None:
-            log.error("%s: no bookable slot found for %s %s", name, session_date, target_time)
+            log.error(f"{name}: no bookable slot found for {session_date} {target_time}")
             notify(
                 subject=f"No slot: {name}",
                 body=f"No bookable slot found for {name} on {session_date} at {target_time}.",
@@ -69,17 +69,27 @@ def run_target(target: dict, username: str, password: str, card: CardDetails) ->
             return
 
         # 3. Get occurrence details
-        log.info("Slot found: %s spaces=%d", slot.id, slot.spaces)
+        log.info(f"Slot found: {slot.id} spaces={slot.spaces}")
         occurrence = api.get_occurrence_details(slot.id)
 
         # 4. Add to cart
         cart_item = api.cart_add(slot, occurrence)
-        log.info("Added to cart: %s  £%.2f", cart_item.name, cart_item.price_pence / 100)
+        log.info(f"Added to cart: {cart_item.name}  £{cart_item.price_pence / 100:.2f}")
 
-        # 5. Complete checkout (Playwright + Opayo CVV)
+        # 5. Check available credit — use it fully, pay remainder by card
+        cart_state = api.get_cart()
+        available_credit = cart_state.get("credits", {}).get("general", {}).get("total_available", 0)
+        balance = cart_state.get("balance", cart_item.price_pence)
+        credit_only = available_credit >= balance
+        if credit_only:
+            log.info(f"Credit covers full balance (£{balance / 100:.2f}) — no card payment needed")
+        elif available_credit > 0:
+            log.info(f"Partial credit £{available_credit / 100:.2f} applied — paying remainder £{(balance - available_credit) / 100:.2f} by card")
+
+        # 6. Complete checkout (Playwright + Opayo CVV)
         try:
-            ref = complete_checkout(card=card, token=token)
-            log.info("Booking complete: %s", ref)
+            ref = complete_checkout(card=card, token=token, headless=headless, credit_only=credit_only)
+            log.info(f"Booking complete: {ref}")
             notify(
                 subject=f"Booked: {name}",
                 body=(
@@ -95,7 +105,7 @@ def run_target(target: dict, username: str, password: str, card: CardDetails) ->
                 api.cart_remove(cart_item.cart_item_id)
             except Exception:
                 pass
-            log.error("Checkout failed: %s", exc)
+            log.error(f"Checkout failed: {exc}")
             notify(
                 subject=f"Booking failed: {name}",
                 body=f"Checkout failed for {name} on {session_date} {target_time}.\n\nError: {exc}",
@@ -131,7 +141,7 @@ def _wait_for_slot(
         try:
             slots = api.get_slots(venue, activity, session_date)
         except BetterAPIError as exc:
-            log.warning("Slot poll error: %s — retrying", exc)
+            log.warning(f"Slot poll error: {exc} — retrying")
             time.sleep(POLL_INTERVAL_S)
             continue
 
@@ -140,10 +150,10 @@ def _wait_for_slot(
             return bookable[0]
 
         if not at_release:
-            log.debug("Pre-release — waiting %ds before next poll", PRE_RELEASE_POLL_S)
+            log.debug(f"Pre-release — waiting {PRE_RELEASE_POLL_S}s before next poll")
             time.sleep(PRE_RELEASE_POLL_S)
         else:
-            log.debug("Slot not yet available — polling in %ds", POLL_INTERVAL_S)
+            log.debug(f"Slot not yet available — polling in {POLL_INTERVAL_S}s")
             time.sleep(POLL_INTERVAL_S)
 
     return None
@@ -160,6 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None, help="Path to config.yaml")
     p.add_argument("--dry-run", action="store_true", help="Poll for slot but do not book")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--no-headless", action="store_true", help="Show browser window (for debugging)")
     return p
 
 
@@ -187,21 +198,17 @@ def main() -> None:
     card_number = os.getenv("CARD_NUMBER")
     card_expiry = os.getenv("CARD_EXPIRY")
 
-    if not cvv:
-        print(
-            "Error: CARD_CVV not set in .env\n"
-            "  Saved card mode:  set CARD_CVV=<3-digit CVV>\n"
-            "  New card mode:    set CARD_NUMBER, CARD_EXPIRY, and CARD_CVV",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # CVV is needed for card payment; may be absent if user always has enough credit.
+    # We allow it to be unset but will fail at checkout if card payment is actually required.
+    if not cvv and not card_number:
+        log.warning("CARD_CVV not set — will only work if account credit covers the full booking cost")
 
     if card_number and not card_expiry:
         print("Error: CARD_NUMBER set but CARD_EXPIRY missing in .env", file=sys.stderr)
         sys.exit(1)
 
-    card = CardDetails(cvv=cvv, number=card_number, expiry=card_expiry)
-    log.info("Payment mode: %s", "new card" if card_number else "saved card")
+    card = CardDetails(cvv=cvv or "", number=card_number, expiry=card_expiry)
+    log.info(f"Payment mode: {'new card' if card_number else 'saved card'}")
 
     enabled = [t for t in targets if t.get("enabled", True)]
 
@@ -223,20 +230,20 @@ def main() -> None:
             _dry_run(target, username, password)
         else:
             try:
-                run_target(target, username, password, card)
+                run_target(target, username, password, card, headless=not args.no_headless)
             except Exception as exc:
-                log.error("Target '%s' failed: %s", target["name"], exc)
+                log.error(f"Target '{target['name']}' failed: {exc}")
 
 
 def _dry_run(target: dict, username: str, password: str) -> None:
     session_date = date.today() + timedelta(days=int(target.get("days_ahead", 7)))
-    log.info("[DRY RUN] %s — checking slots for %s @ %s", target["name"], session_date, target["target_time"])
+    log.info(f"[DRY RUN] {target['name']} — checking slots for {session_date} @ {target['target_time']}")
     with BetterAPI() as api:
         api.login(username, password)
         api.fetch_membership_user_id()
         slots = api.get_slots(target["venue_slug"], target["activity_slug"], session_date)
         for s in slots:
-            log.info("  %s  status=%-6s  spaces=%d  id=%s", s.starts_at, s.status, s.spaces, s.id)
+            log.info(f"  {s.starts_at}  status={s.status:<6}  spaces={s.spaces}  id={s.id}")
 
 
 if __name__ == "__main__":

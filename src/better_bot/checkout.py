@@ -1,8 +1,12 @@
 """Playwright-based checkout flow.
 
-Handles Opayo payment via two modes:
-  - saved card: radio already selected, inject CVV only.
-  - new card:   click "Pay with a different card", fill number + expiry + CVV.
+Handles Opayo payment via three modes:
+  - credit only: full balance covered by account credit — no card entry needed.
+  - saved card:  radio already selected, inject CVV only.
+  - new card:    click "Pay with a different card", fill number + expiry + CVV.
+
+Credit is auto-applied by Better's checkout page; partial credit reduces the
+total and the remainder is charged to the card as normal.
 
 Only this module needs a browser — everything else is pure API.
 """
@@ -27,15 +31,25 @@ class CardDetails:
     expiry: str | None = None   # MM/YY or MM/YYYY
 
 
-def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30, confirm: bool = False) -> str:
+def complete_checkout(
+    card: CardDetails | None,
+    token: str,
+    timeout_s: int = 30,
+    confirm: bool = False,
+    headless: bool = True,
+    credit_only: bool = False,
+) -> str:
     """Navigate to checkout and complete payment.
 
     Args:
         card: Card details. If card.number is set, enters a new card.
               Otherwise uses the pre-selected saved card (CVV only).
+              May be None when credit_only=True.
         token: Valid Better PASETO bearer token (from BetterAPI.login).
         timeout_s: Seconds to wait for booking confirmation.
         confirm: If True, pause and require manual confirmation before clicking Pay.
+        credit_only: If True, account credit covers the full balance — skip all
+                     card/CVV entry and just confirm the booking.
 
     Returns:
         Booking reference string (e.g. "BET-XXXXXXXX").
@@ -45,7 +59,7 @@ def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30, confir
     """
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
-            headless=True,
+            headless=headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
         try:
@@ -78,21 +92,35 @@ def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30, confir
             _dismiss_cookie_banner(page)
             time.sleep(2)
 
-            if card.number:
-                log.info("New card mode — selecting 'Pay with a different card'")
+            if credit_only:
+                log.info("Credit-only mode — applying full credit balance")
+                _apply_full_credit(page)
+            elif card is not None and card.number:
+                log.info("New card mode — applying any available credit then selecting new card")
+                _apply_full_credit(page)
                 _select_new_card(page)
+                log.info("New card mode — filling Opayo iframe…")
+                _fill_opayo_iframe(page, card)
+            else:
+                log.info("Saved card mode — applying any available credit then filling CVV")
+                _apply_full_credit(page)
+                _select_saved_card(page)
+                log.info("Saved card mode — filling CVV textbox…")
+                _fill_saved_card_cvv(page, card.cvv)  # type: ignore[union-attr]
 
-            log.info("Filling card details in Opayo iframe…")
-            _fill_opayo_iframe(page, card)
+            # Check inline T&Cs checkbox before clicking pay (it's on the page, not a post-click modal)
+            _accept_terms_inline(page)
 
-            # Accept T&Cs if present (required to enable Pay button)
-            _accept_terms(page)
-
-            log.info("Waiting for Pay button to enable…")
-            pay_btn = page.locator('button[aria-label="Pay now"], button:has-text("Pay now")').first
-            expect(pay_btn).to_be_enabled(timeout=30_000)
-            log.info("Clicking Pay now…")
+            log.info("Clicking Pay / Continue…")
+            pay_btn = page.locator(
+                'button[aria-label="Pay now"], button:has-text("Pay now"), '
+                'button:has-text("Pay £"), button:has-text("Continue")'
+            ).first
+            expect(pay_btn).to_be_enabled(timeout=15_000)
             pay_btn.click(timeout=10_000)
+
+            # Accept T&Cs modal if it appears after clicking Pay (fallback)
+            _accept_terms(page)
 
             log.info("Waiting for booking confirmation…")
             ref = _wait_for_confirmation(page, timeout_s)
@@ -103,8 +131,69 @@ def complete_checkout(card: CardDetails, token: str, timeout_s: int = 30, confir
 
 
 # ------------------------------------------------------------------
+# Credit helpers
+# ------------------------------------------------------------------
+
+def _apply_full_credit(page: Page) -> None:
+    """Click 'Use full credit balance' and wait for the page to update."""
+    try:
+        btn = page.locator('button:has-text("Use full credit balance")').first
+        if btn.is_visible(timeout=5_000):
+            btn.click()
+            log.debug("Clicked 'Use full credit balance'")
+            # Wait for page to reflect updated total (network idle or URL change)
+            page.wait_for_load_state("networkidle", timeout=10_000)
+            time.sleep(1)
+            return
+    except Exception as exc:
+        log.debug(f"'Use full credit balance' button not found or click failed: {exc}")
+    log.debug("Credit may already be applied or button not present")
+
+
+# ------------------------------------------------------------------
 # Payment mode helpers
 # ------------------------------------------------------------------
+
+def _select_saved_card(page: Page) -> None:
+    """Click the saved card radio button."""
+    for selector in [
+        'input[type="radio"]:not([value*="different"])',
+        'label:has-text("Pay with saved card")',
+        'input[value*="saved"]',
+    ]:
+        try:
+            el = page.locator(selector).first
+            if el.is_visible(timeout=3_000):
+                el.click()
+                time.sleep(1)
+                log.debug("Selected saved card via %s", selector)
+                return
+        except Exception:
+            continue
+    log.debug("Saved card radio not found — assuming already selected")
+
+
+def _fill_saved_card_cvv(page: Page, cvv: str) -> None:
+    """Fill CVV into the plain textbox shown for saved card mode."""
+    for selector in [
+        'input[placeholder="CVV"]',
+        'input[placeholder*="CV"]',
+        'input[aria-label*="CVV"]',
+        'input[aria-label*="Security"]',
+        'input[name*="cvv"]',
+        'input[name*="security"]',
+    ]:
+        try:
+            loc = page.locator(selector).first
+            if loc.is_visible(timeout=3_000):
+                loc.click()
+                loc.type(cvv, delay=80)
+                log.debug("CVV filled via %s", selector)
+                return
+        except Exception:
+            continue
+    raise RuntimeError("Could not locate CVV textbox in saved card mode")
+
 
 def _select_new_card(page: Page) -> None:
     """Click the 'Pay with a different card' radio/button."""
@@ -128,18 +217,26 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
     """Locate the Opayo iframe and fill the required fields."""
     # Wait for Opayo iframe src to be populated in the DOM, then use
     # frame_locator (finds by element selector, handles frame load timing).
-    log.debug("Waiting for Opayo iframe src to populate...")
+    log.debug("Waiting for Opayo iframe to load...")
     try:
         page.wait_for_function(
             "() => { const f = document.querySelector('iframe'); "
-            "return f && f.src && (f.src.includes('opayo') || f.src.includes('elavon')); }",
-            timeout=120_000,
+            "return f && f.src && f.src !== 'about:blank'; }",
+            timeout=30_000,
         )
+        log.debug("Iframe src populated")
     except Exception as exc:
         log.debug("wait_for_function timed out: %s", exc)
 
+    # Log iframe src for debugging
+    try:
+        src = page.evaluate("() => { const f = document.querySelector('iframe'); return f ? f.src : 'NO IFRAME'; }")
+        log.debug("Iframe src: %s", src)
+    except Exception:
+        pass
+
     opayo = page.frame_locator(
-        'iframe#payment-iframe, iframe[src*="opayo"], iframe[src*="elavon"]'
+        'iframe#payment-iframe, iframe[src*="opayo"], iframe[src*="elavon"], iframe[src*="pi."], iframe:not([src="about:blank"])'
     )
 
     if card.number:
@@ -262,31 +359,75 @@ def _extract_reference(page: Page) -> str:
 # Page helpers
 # ------------------------------------------------------------------
 
-def _accept_terms(page: Page) -> None:
-    """Check the T&Cs checkbox if present and unchecked."""
+def _accept_terms_inline(page: Page) -> None:
+    """Check the inline T&Cs checkbox on the checkout page (pre-pay step).
+
+    Better's checkout page has a checkbox "I agree to the Terms and Conditions"
+    near the bottom. Must be checked before clicking Continue/Pay.
+    """
     for selector in [
         'input[type="checkbox"][id*="terms"]',
         'input[type="checkbox"][name*="terms"]',
-        'input[type="checkbox"][aria-label*="Terms"]',
         'label:has-text("Terms and Conditions") input[type="checkbox"]',
-        '[data-testid*="terms"] input',
+        'input[type="checkbox"]',   # last-resort: any checkbox on page
     ]:
         try:
             cb = page.locator(selector).first
-            if cb.is_visible(timeout=2_000) and not cb.is_checked():
+            if cb.is_visible(timeout=2_000):
+                if not cb.is_checked():
+                    cb.check()
+                    log.debug("T&Cs inline checkbox checked via %s", selector)
+                else:
+                    log.debug("T&Cs inline checkbox already checked via %s", selector)
+                return
+        except Exception:
+            continue
+    log.debug("T&Cs inline checkbox not found — may already be accepted")
+
+
+def _accept_terms(page: Page) -> None:
+    """Click 'I Agree' on T&Cs modal, or check T&Cs checkbox if present."""
+    # Modal with "I Agree" button (appears after clicking Continue)
+    # We pre-click Continue then handle modal — but better to handle before.
+    # The modal may appear on page load; try to dismiss it first.
+    try:
+        btn = page.locator('button:has-text("I Agree")').first
+        if btn.is_visible(timeout=3_000):
+            # Scroll modal content to bottom so "I Agree" enables
+            page.evaluate("""
+                () => {
+                    const modal = document.querySelector('[role="dialog"], .modal, [class*="modal"], [class*="dialog"]');
+                    if (modal) modal.scrollTop = modal.scrollHeight;
+                    // Also scroll any overflow containers inside
+                    document.querySelectorAll('*').forEach(el => {
+                        if (el.scrollHeight > el.clientHeight && el.clientHeight > 50 && el.clientHeight < 600) {
+                            el.scrollTop = el.scrollHeight;
+                        }
+                    });
+                }
+            """)
+            time.sleep(0.3)
+            btn.scroll_into_view_if_needed()
+            btn.click()
+            log.debug("T&Cs accepted via 'I Agree' button")
+            time.sleep(0.5)
+            return
+    except Exception:
+        pass
+    # Fallback: checkbox
+    for selector in [
+        'input[type="checkbox"][id*="terms"]',
+        'input[type="checkbox"][name*="terms"]',
+        'label:has-text("Terms and Conditions") input[type="checkbox"]',
+    ]:
+        try:
+            cb = page.locator(selector).first
+            if cb.is_visible(timeout=1_000) and not cb.is_checked():
                 cb.check()
                 log.debug("T&Cs accepted via %s", selector)
                 return
         except Exception:
             continue
-    # Try clicking the label as fallback
-    try:
-        label = page.locator('label:has-text("Terms and Conditions")').first
-        if label.is_visible(timeout=2_000):
-            label.click()
-            log.debug("T&Cs accepted via label click")
-    except Exception:
-        pass
 
 
 def _block_analytics(page: Page) -> None:

@@ -20,3 +20,4 @@ targets:
     release_hour: 21
     cron: "57 20 * * 6"          # fire at 20:57 Saturday
     enabled: true
+
