@@ -1,0 +1,18 @@
+[Unit]
+Description=Better booking bot daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=better-bot
+WorkingDirectory=/opt/better-booking-bot
+ExecStart=/opt/better-booking-bot/.venv/bin/python daemon.py
+EnvironmentFile=/opt/better-booking-bot/.env
+Restart=on-failure
+RestartSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

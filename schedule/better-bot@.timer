@@ -1,0 +1,15 @@
+[Unit]
+Description=Better booking bot timer — %i
+Requires=better-bot@%i.service
+
+[Timer]
+# Override per-instance via drop-in:
+#   /etc/systemd/system/better-bot@Abingdon.timer.d/override.conf
+#   [Timer]
+#   OnCalendar=Mon *-*-* 20:57:00
+OnCalendar=Mon *-*-* 20:57:00
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
