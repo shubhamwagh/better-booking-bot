@@ -207,7 +207,17 @@ def main() -> None:
         print("Error: CARD_NUMBER set but CARD_EXPIRY missing in .env", file=sys.stderr)
         sys.exit(1)
 
-    card = CardDetails(cvv=cvv or "", number=card_number, expiry=card_expiry)
+    card = CardDetails(
+        cvv=cvv or "",
+        number=card_number,
+        expiry=card_expiry,
+        first_name=os.getenv("BILLING_FIRST_NAME"),
+        last_name=os.getenv("BILLING_LAST_NAME"),
+        address1=os.getenv("BILLING_ADDRESS1"),
+        address2=os.getenv("BILLING_ADDRESS2"),
+        city=os.getenv("BILLING_CITY"),
+        postcode=os.getenv("BILLING_POSTCODE"),
+    )
     log.info(f"Payment mode: {'new card' if card_number else 'saved card'}")
 
     enabled = [t for t in targets if t.get("enabled", True)]

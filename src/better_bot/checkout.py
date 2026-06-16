@@ -27,8 +27,15 @@ log = logging.getLogger(__name__)
 @dataclass
 class CardDetails:
     cvv: str
-    number: str | None = None   # set to use new-card mode
-    expiry: str | None = None   # MM/YY or MM/YYYY
+    number: str | None = None     # set to use new-card mode
+    expiry: str | None = None     # MM/YY or MM/YYYY
+    # Billing address — required for new card mode
+    first_name: str | None = None
+    last_name: str | None = None
+    address1: str | None = None
+    address2: str | None = None
+    city: str | None = None
+    postcode: str | None = None
 
 
 def complete_checkout(
@@ -99,6 +106,8 @@ def complete_checkout(
                 log.info("New card mode — applying any available credit then selecting new card")
                 _apply_full_credit(page)
                 _select_new_card(page)
+                log.info("New card mode — filling billing details…")
+                _fill_billing_details(page, card)
                 log.info("New card mode — filling Opayo iframe…")
                 _fill_opayo_iframe(page, card)
             else:
@@ -193,6 +202,31 @@ def _fill_saved_card_cvv(page: Page, cvv: str) -> None:
         except Exception:
             continue
     raise RuntimeError("Could not locate CVV textbox in saved card mode")
+
+
+def _fill_billing_details(page: Page, card: CardDetails) -> None:
+    """Fill First name, Last name, Address, Town/city, Postcode for new card mode."""
+    fields = [
+        (card.first_name, ['input[placeholder="First name"]', 'input[id*="first"], input[name*="first"]']),
+        (card.last_name,  ['input[placeholder="Last name"]',  'input[id*="last"],  input[name*="last"]']),
+        (card.address1,   ['input[placeholder="Address line 1"]', 'input[id*="address1"], input[name*="address1"]']),
+        (card.address2,   ['input[placeholder="Address line 2"]', 'input[id*="address2"], input[name*="address2"]']),
+        (card.city,       ['input[placeholder="Town/city"]', 'input[id*="city"], input[name*="city"]', 'input[placeholder*="Town"]']),
+        (card.postcode,   ['input[placeholder="Postcode"]',  'input[id*="post"], input[name*="post"]']),
+    ]
+    for value, selectors in fields:
+        if not value:
+            continue
+        for selector in selectors:
+            try:
+                loc = page.locator(selector).first
+                if loc.is_visible(timeout=2_000):
+                    loc.click()
+                    loc.fill(value)
+                    log.debug(f"Billing field filled via {selector}")
+                    break
+            except Exception:
+                continue
 
 
 def _select_new_card(page: Page) -> None:
