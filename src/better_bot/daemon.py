@@ -145,7 +145,15 @@ def _add_job(
         return
 
     try:
-        trigger = CronTrigger.from_crontab(cron, timezone="Europe/London")
+        minute, hour, day, month, dow = cron.split()
+        trigger = CronTrigger(
+            minute=minute,
+            hour=hour,
+            day=day,
+            month=month,
+            day_of_week=_crontab_dow_to_apscheduler(dow),
+            timezone="Europe/London",
+        )
     except Exception as exc:
         log.error("Invalid cron '%s' for target '%s': %s", cron, target["name"], exc)
         return
@@ -160,6 +168,24 @@ def _add_job(
         misfire_grace_time=120,
     )
     log.info("Scheduled '%s'  cron='%s'", target["name"], cron)
+
+
+def _crontab_dow_to_apscheduler(dow: str) -> str:
+    """Convert standard crontab day-of-week (0/7=Sun..6=Sat) to APScheduler's
+    day_of_week convention (0=Mon..6=Sun). Named/wildcard tokens pass through
+    unchanged since APScheduler's own names already match its convention.
+    """
+    def convert(token: str) -> str:
+        base, _, step = token.partition("/")
+        if "-" in base:
+            start, end = base.split("-")
+            if start.isdigit() and end.isdigit():
+                base = f"{(int(start) - 1) % 7}-{(int(end) - 1) % 7}"
+        elif base.isdigit():
+            base = str((int(base) - 1) % 7)
+        return f"{base}/{step}" if step else base
+
+    return ",".join(convert(t) for t in dow.split(","))
 
 
 def _job_id(target: dict) -> str:
