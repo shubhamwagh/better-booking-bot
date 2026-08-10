@@ -8,11 +8,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -37,6 +38,33 @@ def load_config(path: str | None = None) -> list[dict]:
 
 
 # ------------------------------------------------------------------
+# Booking status - last-run result per target, for the web UI's
+# history page. Lives next to config.yaml, so it rides along on the
+# same shared volume with no extra deployment config.
+# ------------------------------------------------------------------
+
+def status_path() -> Path:
+    config_path = Path(os.getenv("CONFIG_PATH", "config.yaml"))
+    return config_path.parent / "status.json"
+
+
+def record_status(name: str, status: str, session_date: date, target_time: str, detail: str = "") -> None:
+    path = status_path()
+    try:
+        data = json.loads(path.read_text()) if path.exists() else {}
+    except Exception:
+        data = {}
+    data[name] = {
+        "status": status,  # "booked" | "no_slot" | "failed"
+        "session_date": session_date.isoformat(),
+        "target_time": target_time,
+        "detail": detail,
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(data, indent=2))
+
+
+# ------------------------------------------------------------------
 # Core booking flow
 # ------------------------------------------------------------------
 
@@ -51,56 +79,62 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
     session_date = date.today() + timedelta(days=days_ahead)
     log.info(f"Target: {name} | Date: {session_date} | Time: {target_time}")
 
-    with BetterAPI() as api:
-        # 1. Login
-        api.login(username, password)
-        token = api._token  # noqa: SLF001  - needed for checkout browser session
-        api.fetch_membership_user_id()
+    try:
+        with BetterAPI() as api:
+            # 1. Login
+            api.login(username, password)
+            token = api._token  # noqa: SLF001  - needed for checkout browser session
+            api.fetch_membership_user_id()
 
-        # 2. Poll until slot opens
-        slot = _wait_for_slot(api, venue, activity, session_date, target_time, release_hour)
+            # 2. Poll until slot opens
+            slot = _wait_for_slot(api, venue, activity, session_date, target_time, release_hour)
 
-        if slot is None:
-            log.error(f"{name}: no bookable slot found for {session_date} {target_time}")
-            notify(
-                subject=f"No slot: {name}",
-                body=f"No bookable slot found for {name} on {session_date} at {target_time}.",
-            )
-            return
+            if slot is None:
+                log.error(f"{name}: no bookable slot found for {session_date} {target_time}")
+                notify(
+                    subject=f"No slot: {name}",
+                    body=f"No bookable slot found for {name} on {session_date} at {target_time}.",
+                )
+                record_status(name, "no_slot", session_date, target_time)
+                return
 
-        # 3. Get occurrence details
-        log.info(f"Slot found: {slot.id} spaces={slot.spaces}")
-        occurrence = api.get_occurrence_details(slot.id)
+            # 3. Get occurrence details
+            log.info(f"Slot found: {slot.id} spaces={slot.spaces}")
+            occurrence = api.get_occurrence_details(slot.id)
 
-        # 4. Add to cart
-        cart_item = api.cart_add(slot, occurrence)
-        log.info(f"Added to cart: {cart_item.name}  £{cart_item.price_pence / 100:.2f}")
+            # 4. Add to cart
+            cart_item = api.cart_add(slot, occurrence)
+            log.info(f"Added to cart: {cart_item.name}  £{cart_item.price_pence / 100:.2f}")
 
-        # 5. Complete checkout - auto-detects credit/saved-card/new-card from page
-        try:
-            ref = complete_checkout(card=card, token=token, headless=headless)
-            log.info(f"Booking complete: {ref}")
-            notify(
-                subject=f"Booked: {name}",
-                body=(
-                    f"Booking confirmed!\n\n"
-                    f"Activity: {name}\n"
-                    f"Session:  {session_date} {target_time}\n"
-                    f"Price:    £{cart_item.price_pence / 100:.2f}\n"
-                    f"Ref:      {ref}"
-                ),
-            )
-        except Exception as exc:
+            # 5. Complete checkout - auto-detects credit/saved-card/new-card from page
             try:
-                api.cart_remove(cart_item.cart_item_id)
-            except Exception:
-                pass
-            log.error(f"Checkout failed: {exc}")
-            notify(
-                subject=f"Booking failed: {name}",
-                body=f"Checkout failed for {name} on {session_date} {target_time}.\n\nError: {exc}",
-            )
-            raise
+                ref = complete_checkout(card=card, token=token, headless=headless)
+                log.info(f"Booking complete: {ref}")
+                notify(
+                    subject=f"Booked: {name}",
+                    body=(
+                        f"Booking confirmed!\n\n"
+                        f"Activity: {name}\n"
+                        f"Session:  {session_date} {target_time}\n"
+                        f"Price:    £{cart_item.price_pence / 100:.2f}\n"
+                        f"Ref:      {ref}"
+                    ),
+                )
+                record_status(name, "booked", session_date, target_time, detail=ref)
+            except Exception as exc:
+                try:
+                    api.cart_remove(cart_item.cart_item_id)
+                except Exception:
+                    pass
+                log.error(f"Checkout failed: {exc}")
+                notify(
+                    subject=f"Booking failed: {name}",
+                    body=f"Checkout failed for {name} on {session_date} {target_time}.\n\nError: {exc}",
+                )
+                raise
+    except Exception as exc:
+        record_status(name, "failed", session_date, target_time, detail=str(exc))
+        raise
 
 
 # ------------------------------------------------------------------

@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import logging
 import os
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -55,6 +56,12 @@ ICON_PLUS = _svg('<path d="M12 5v14M5 12h14"/>', 16)
 ICON_POWER = _svg('<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>', 15)
 ICON_TRASH = _svg('<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/>', 15)
 ICON_EMPTY = _svg('<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 15h.01M12 15h.01M16 15h.01"/>', 40)
+ICON_CHECK = _svg('<circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/>', 15)
+ICON_DASH = _svg('<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>', 15)
+ICON_X = _svg('<circle cx="12" cy="12" r="9"/><path d="m9.5 9.5 5 5m0-5-5 5"/>', 15)
+
+STATUS_ICONS = {"booked": ICON_CHECK, "no_slot": ICON_DASH, "failed": ICON_X}
+STATUS_LABELS = {"booked": "booked", "no_slot": "no slot found", "failed": "failed"}
 
 _api = BetterAPI()  # unauthenticated: only used for the public venue/activity/times lookups below
 
@@ -121,6 +128,20 @@ def save_config(data: dict) -> None:
     path = _config_path()
     with path.open("w") as f:
         yaml.safe_dump(data, f, sort_keys=False)
+
+
+def _status_path() -> Path:
+    return _config_path().parent / "status.json"
+
+
+def load_status() -> dict:
+    path = _status_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
 
 
 def build_cron(weekday: str, release_hour: int) -> str:
@@ -215,12 +236,67 @@ button.danger:hover {{ background: var(--danger); color: #fff; border-color: var
 .empty {{ color: var(--muted); font-size: 0.9rem; text-align: center; padding: 1.5rem 0; }}
 .empty svg {{ display: block; margin: 0 auto 0.75rem; color: var(--border); }}
 .err {{ color: var(--danger); font-size: 0.85rem; margin-bottom: 0.75rem; }}
+.nav {{ display: flex; gap: 1rem; margin-bottom: 1.75rem; font-size: 0.85rem; }}
+.nav a {{ color: var(--muted); text-decoration: none; }}
+.nav a:hover, .nav a.active {{ color: var(--accent); }}
+.history-status {{ display: inline-flex; align-items: center; gap: 0.4rem; }}
+.history-status svg {{ flex-shrink: 0; }}
+.history-status.booked {{ color: var(--ok-text); }}
+.history-status.no_slot {{ color: var(--muted); }}
+.history-status.failed {{ color: var(--danger); }}
 </style></head>
 <body>
 <h1><span class="logo">{ICON_LOGO}</span> Better Booking Bot</h1>
 <div class="subtitle">Manage what to auto-book next week.</div>
+<div class="nav"><a href="/">Targets</a><a href="/status">History</a></div>
 {body}
 </body></html>"""
+
+
+def _relative_time(iso_str: str) -> str:
+    try:
+        then = datetime.fromisoformat(iso_str)
+        now = datetime.now(then.tzinfo)
+    except ValueError:
+        return iso_str
+    seconds = (now - then).total_seconds()
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
+def _status_page(targets: list[dict], status: dict) -> str:
+    if not targets:
+        return f'''<div class="card"><h2>{ICON_LIST} History</h2><p class="empty">{ICON_EMPTY}No targets configured yet.</p></div>'''
+    rows = []
+    for t in targets:
+        name = html.escape(t["name"])
+        entry = status.get(t["name"])
+        if entry is None:
+            result = '<span class="history-status" style="color: var(--muted)">not run yet</span>'
+            when = "-"
+        else:
+            key = entry.get("status", "failed")
+            icon = STATUS_ICONS.get(key, ICON_X)
+            label = STATUS_LABELS.get(key, key)
+            detail = html.escape(entry.get("detail", ""))
+            title = f' title="{detail}"' if detail else ""
+            result = f'<span class="history-status {key}"{title}>{icon}{label}</span>'
+            when = html.escape(_relative_time(entry.get("ran_at", "")))
+        rows.append(f"<tr><td>{name}</td><td>{result}</td><td>{when}</td></tr>")
+    return f"""<div class="card">
+<h2>{ICON_LIST} History</h2>
+<div class="table-wrap">
+<table>
+<tr><th>target</th><th>last result</th><th>when</th></tr>
+{''.join(rows)}
+</table>
+</div>
+</div>"""
 
 
 def _targets_table(targets: list[dict]) -> str:
@@ -421,6 +497,12 @@ def api_times(venue_slug: str, activity_slug: str, weekday: str) -> list[str]:
 def index() -> str:
     targets = load_config().get("targets", [])
     return _page(_targets_table(targets) + _add_form())
+
+
+@app.get("/status", response_class=HTMLResponse)
+def status_page() -> str:
+    targets = load_config().get("targets", [])
+    return _page(_status_page(targets, load_status()))
 
 
 @app.post("/targets")

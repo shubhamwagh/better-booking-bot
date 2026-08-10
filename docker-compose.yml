@@ -7,6 +7,8 @@ services:
     volumes:
       # Optional: mount your own config.yaml to customise targets
       - ./config.yaml:/app/config.yaml:ro
+      # read-write: better-bot records the last-run result of each target here
+      - ./status.json:/app/status.json
 
   webui:
     image: ghcr.io/shubhamwagh/better-booking-bot:latest
@@ -17,3 +19,5 @@ services:
     volumes:
       # read-write: the web UI edits this file; better-bot picks up changes within CONFIG_POLL_S
       - ./config.yaml:/app/config.yaml
+      # read-only: the web UI's History page reads this, better-bot writes it
+      - ./status.json:/app/status.json:ro
