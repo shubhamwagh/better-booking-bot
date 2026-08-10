@@ -118,6 +118,37 @@ def test_get_slots_returns_parsed_slots():
 
 
 @respx.mock
+def test_get_slots_skips_malformed_entry():
+    payload = {
+        "data": [
+            {
+                "id": "slot-1",
+                "starts_at": {"format_24_hour": "19:30"},
+                "action_to_show": {"status": None},
+                "spaces_remaining": 5,
+                "composite_key": "ck-1",
+            },
+            {
+                "id": "slot-2",
+                "starts_at": {"format_24_hour": "20:00"},
+                "action_to_show": {"status": "BOOK"},
+                "spaces_remaining": 3,
+                "composite_key": "ck-2",
+            },
+        ]
+    }
+    from datetime import date
+    respx.get(f"{BASE}/activities/venue/venue-a/activity/act-b/v2/times").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    api = BetterAPI()
+    slots = api.get_slots("venue-a", "act-b", date(2026, 6, 21))
+    assert len(slots) == 1
+    assert slots[0].id == "slot-2"
+    api.close()
+
+
+@respx.mock
 def test_get_slots_422_returns_empty():
     from datetime import date
     respx.get(f"{BASE}/activities/venue/v/activity/a/v2/times").mock(

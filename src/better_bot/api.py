@@ -133,13 +133,18 @@ class BetterAPI:
             raise
         slots = []
         for t in resp.get("data", []):
-            slots.append(Slot(
-                id=t["id"],
-                starts_at=t["starts_at"]["format_24_hour"],
-                status=t["action_to_show"]["status"],
-                spaces=t.get("spaces_remaining", 0),
-                composite_key=t["composite_key"],
-            ))
+            try:
+                slots.append(Slot(
+                    id=t["id"],
+                    starts_at=t["starts_at"]["format_24_hour"],
+                    status=t["action_to_show"]["status"],
+                    spaces=t.get("spaces_remaining", 0),
+                    composite_key=t["composite_key"],
+                ))
+            except Exception as exc:
+                # One malformed entry (e.g. a null status) shouldn't crash
+                # the whole poll - skip it and keep looking at the rest.
+                log.warning("Skipping malformed slot entry %r: %s", t.get("composite_key"), exc)
         return slots
 
     # ------------------------------------------------------------------
