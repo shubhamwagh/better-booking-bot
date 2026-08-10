@@ -41,6 +41,21 @@ WEEKDAYS = [
 
 PREWARM_MINUTES = 3  # fire this many minutes before release_hour, matching existing targets
 
+
+def _svg(path: str, size: int = 18) -> str:
+    return (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        f'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{path}</svg>'
+    )
+
+
+ICON_LOGO = _svg('<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="m9 16 2 2 4-4"/>', 26)
+ICON_LIST = _svg('<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>', 16)
+ICON_PLUS = _svg('<path d="M12 5v14M5 12h14"/>', 16)
+ICON_POWER = _svg('<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>', 15)
+ICON_TRASH = _svg('<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/>', 15)
+ICON_EMPTY = _svg('<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 15h.01M12 15h.01M16 15h.01"/>', 40)
+
 _api = BetterAPI()  # unauthenticated: only used for the public venue/activity/times lookups below
 
 _CACHE_TTL_S = 3600
@@ -143,13 +158,15 @@ body {{
   background: var(--bg); color: var(--text);
   max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem;
 }}
-h1 {{ font-size: 1.4rem; margin-bottom: 0.25rem; }}
+h1 {{ font-size: 1.4rem; margin: 0 0 0.25rem; display: flex; align-items: center; gap: 0.5rem; }}
+h1 .logo {{ color: var(--accent); display: inline-flex; }}
 .subtitle {{ color: var(--muted); font-size: 0.9rem; margin-bottom: 1.75rem; }}
 .card {{
   background: var(--card); border: 1px solid var(--border); border-radius: 12px;
   padding: 1.25rem 1.5rem; margin-bottom: 1.75rem; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
 }}
-.card h2 {{ font-size: 1rem; margin: 0 0 1rem; }}
+.card h2 {{ font-size: 1rem; margin: 0 0 1rem; display: flex; align-items: center; gap: 0.45rem; color: var(--text); }}
+.card h2 svg {{ color: var(--muted); }}
 table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
 th {{ text-align: left; padding: 0.5rem 0.6rem; color: var(--muted); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 1px solid var(--border); }}
 td {{ padding: 0.6rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: middle; }}
@@ -173,16 +190,20 @@ select:disabled {{ opacity: 0.55; cursor: not-allowed; }}
 button {{
   padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600; border-radius: 8px;
   border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer;
+  display: inline-flex; align-items: center; gap: 0.35rem; line-height: 1;
 }}
 button:hover {{ border-color: var(--accent); }}
 button.primary {{ margin-top: 1.1rem; background: var(--accent); color: #fff; border-color: var(--accent); }}
 button.primary:hover {{ background: var(--accent-hover); }}
 button.danger:hover {{ background: var(--danger); color: #fff; border-color: var(--danger); }}
-.empty {{ color: var(--muted); font-size: 0.9rem; }}
+.badge {{ display: inline-flex; align-items: center; gap: 0.35rem; }}
+.badge::before {{ content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }}
+.empty {{ color: var(--muted); font-size: 0.9rem; text-align: center; padding: 1.5rem 0; }}
+.empty svg {{ display: block; margin: 0 auto 0.75rem; color: var(--border); }}
 .err {{ color: var(--danger); font-size: 0.85rem; margin-bottom: 0.75rem; }}
 </style></head>
 <body>
-<h1>Better Booking Bot</h1>
+<h1><span class="logo">{ICON_LOGO}</span> Better Booking Bot</h1>
 <div class="subtitle">Manage what to auto-book next week.</div>
 {body}
 </body></html>"""
@@ -190,7 +211,7 @@ button.danger:hover {{ background: var(--danger); color: #fff; border-color: var
 
 def _targets_table(targets: list[dict]) -> str:
     if not targets:
-        return '<div class="card"><h2>Targets</h2><p class="empty">No targets configured yet - add one below.</p></div>'
+        return f'''<div class="card"><h2>{ICON_LIST} Targets</h2><p class="empty">{ICON_EMPTY}No targets configured yet - add one below.</p></div>'''
     rows = []
     for t in targets:
         name = html.escape(t["name"])
@@ -205,12 +226,12 @@ def _targets_table(targets: list[dict]) -> str:
 <td>{t.get('days_ahead', 7)}d / {t.get('release_hour', 21)}:00</td>
 <td>{badge}</td>
 <td class="actions">
-<form class="inline" method="post" action="/targets/{url_name}/toggle"><button>{'disable' if enabled else 'enable'}</button></form>
-<form class="inline" method="post" action="/targets/{url_name}/delete" onsubmit="return confirm('Delete {name}?')"><button class="danger">delete</button></form>
+<form class="inline" method="post" action="/targets/{url_name}/toggle"><button>{ICON_POWER}{'disable' if enabled else 'enable'}</button></form>
+<form class="inline" method="post" action="/targets/{url_name}/delete" onsubmit="return confirm('Delete {name}?')"><button class="danger">{ICON_TRASH}delete</button></form>
 </td>
 </tr>""")
     return f"""<div class="card">
-<h2>Targets</h2>
+<h2>{ICON_LIST} Targets</h2>
 <table>
 <tr><th>name</th><th>venue / activity</th><th>time</th><th>opens</th><th>status</th><th></th></tr>
 {''.join(rows)}
@@ -229,7 +250,7 @@ def _add_form(error: str | None = None) -> str:
     )
     err = f'<p class="err">{html.escape(error)}</p>' if error else ""
     return f"""<div class="card">
-<h2>Add target</h2>
+<h2>{ICON_PLUS} Add target</h2>
 {err}
 <form method="post" action="/targets">
 <div class="grid">
@@ -241,7 +262,7 @@ def _add_form(error: str | None = None) -> str:
 <div><label>Days ahead slot opens</label><select name="days_ahead">{days_ahead_options}</select></div>
 <div><label>Release hour (local)</label><select name="release_hour">{release_hour_options}</select></div>
 </div>
-<button type="submit" class="primary">Add target</button>
+<button type="submit" class="primary">{ICON_PLUS} Add target</button>
 </form>
 </div>
 <script>
