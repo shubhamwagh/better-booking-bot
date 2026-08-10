@@ -16,11 +16,15 @@ Monitors slot availability, applies account credit, and completes payment automa
 git clone https://github.com/shubhamwagh/better-booking-bot.git
 cd better-booking-bot
 cp .env.example .env          # fill in your credentials
-docker compose up -d          # runs as daemon, self-schedules from config.yaml
+docker compose up -d          # runs the daemon + web UI, self-schedules from config.yaml
 docker compose logs -f        # watch logs
 ```
 
 The image is pre-built and published to GHCR - no build step needed.
+
+Open `http://localhost:8080` for the web UI to add/enable/disable/delete targets - venue and
+activity are picked from live dropdowns (backed by the Better API), so no slugs to type by hand.
+Edits take effect within `CONFIG_POLL_S` seconds without restarting the daemon.
 
 ## Configuration
 
