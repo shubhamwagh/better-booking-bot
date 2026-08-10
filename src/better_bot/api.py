@@ -41,6 +41,7 @@ class CartItem(BaseModel):
 class Venue(BaseModel):
     slug: str
     name: str
+    town: str
 
 
 class Activity(BaseModel):
@@ -94,7 +95,7 @@ class BetterAPI:
 
     def list_venues(self) -> list[Venue]:
         resp = self._get("/activities/venues")
-        return [Venue(slug=v["slug"], name=v["name"]) for v in resp.get("data", [])]
+        return [Venue(slug=v["slug"], name=v["name"], town=v["town"]) for v in resp.get("data", [])]
 
     def list_activities(self, venue_slug: str) -> list[Activity]:
         resp = self._get(f"/activities/venue/{venue_slug}/categories")
