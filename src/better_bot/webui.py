@@ -15,13 +15,17 @@ import html
 import logging
 import os
 import re
+import time
+from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 import yaml
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.status import HTTP_303_SEE_OTHER
+
+from better_bot.api import BetterAPI, BetterAPIError
 
 log = logging.getLogger(__name__)
 
@@ -37,16 +41,57 @@ WEEKDAYS = [
 
 PREWARM_MINUTES = 3  # fire this many minutes before release_hour, matching existing targets
 
+_api = BetterAPI()  # unauthenticated: only used for the public venue/activity/times lookups below
+
+_CACHE_TTL_S = 3600
+_venues_cache: tuple[float, list[dict]] | None = None
+_activities_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _cached_venues() -> list[dict]:
+    global _venues_cache
+    if _venues_cache is None or time.monotonic() - _venues_cache[0] > _CACHE_TTL_S:
+        venues = sorted(
+            ({"slug": v.slug, "name": v.name} for v in _api.list_venues()),
+            key=lambda v: v["name"],
+        )
+        _venues_cache = (time.monotonic(), venues)
+    return _venues_cache[1]
+
+
+def _cached_activities(venue_slug: str) -> list[dict]:
+    cached = _activities_cache.get(venue_slug)
+    if cached is None or time.monotonic() - cached[0] > _CACHE_TTL_S:
+        activities = sorted(
+            ({"slug": a.slug, "name": a.name, "category": a.category} for a in _api.list_activities(venue_slug)),
+            key=lambda a: (a["category"], a["name"]),
+        )
+        _activities_cache[venue_slug] = (time.monotonic(), activities)
+    return _activities_cache[venue_slug][1]
+
+
+def _next_dates_for_weekday(cron_weekday: str, count: int = 4) -> list[date]:
+    """Upcoming dates (today + weekly steps) matching a cron day-of-week (0=Sun..6=Sat)."""
+    python_weekday = (int(cron_weekday) + 6) % 7  # cron dow -> Mon=0..Sun=6
+    today = date.today()
+    first = today + timedelta(days=(python_weekday - today.weekday()) % 7)
+    return [first + timedelta(weeks=i) for i in range(count)]
+
+
+def _typical_times(venue_slug: str, activity_slug: str, cron_weekday: str) -> list[str]:
+    """Distinct session start times seen on the next few occurrences of this weekday."""
+    for candidate_date in _next_dates_for_weekday(cron_weekday):
+        try:
+            slots = _api.get_slots(venue_slug, activity_slug, candidate_date)
+        except BetterAPIError:
+            continue
+        if slots:
+            return sorted({s.starts_at for s in slots})
+    return []
+
 
 def _config_path() -> Path:
     return Path(os.getenv("CONFIG_PATH", "config.yaml"))
-
-
-def known_venue_activity_pairs(targets: list[dict]) -> list[tuple[str, str]]:
-    seen: dict[tuple[str, str], None] = {}
-    for t in targets:
-        seen.setdefault((t["venue_slug"], t["activity_slug"]), None)
-    return sorted(seen)
 
 
 def load_config() -> dict:
@@ -124,6 +169,7 @@ input, select {{
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
 }}
 input:focus, select:focus {{ outline: none; border-color: var(--accent); }}
+select:disabled {{ opacity: 0.55; cursor: not-allowed; }}
 button {{
   padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600; border-radius: 8px;
   border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer;
@@ -172,12 +218,14 @@ def _targets_table(targets: list[dict]) -> str:
 </div>"""
 
 
-def _add_form(targets: list[dict], error: str | None = None) -> str:
+def _add_form(error: str | None = None) -> str:
     weekday_options = "".join(f'<option value="{v}">{label}</option>' for v, label in WEEKDAYS)
-    pairs = known_venue_activity_pairs(targets)
-    pair_options = "".join(
-        f'<option value="{html.escape(v)}|{html.escape(a)}">{html.escape(v)} / {html.escape(a)}</option>'
-        for v, a in pairs
+    days_ahead_options = "".join(
+        f'<option value="{n}"{" selected" if n == 7 else ""}>{n} day{"s" if n != 1 else ""}</option>'
+        for n in range(1, 15)
+    )
+    release_hour_options = "".join(
+        f'<option value="{h}"{" selected" if h == 21 else ""}>{h:02d}:00</option>' for h in range(24)
     )
     err = f'<p class="err">{html.escape(error)}</p>' if error else ""
     return f"""<div class="card">
@@ -186,60 +234,156 @@ def _add_form(targets: list[dict], error: str | None = None) -> str:
 <form method="post" action="/targets">
 <div class="grid">
 <div class="full"><label>Name</label><input name="name" required></div>
-<div class="full">
-<label>Venue / activity</label>
-<select id="known_pair" onchange="onPairChange()">
-{pair_options}
-<option value="__custom__">+ New venue / activity...</option>
-</select>
-</div>
-<div id="custom_slugs" class="full grid" style="display: none; padding: 0;">
-<div><label>Venue slug</label><input id="venue_slug_input" placeholder="white-horse-leisure-and-tennis-centre"></div>
-<div><label>Activity slug</label><input id="activity_slug_input" placeholder="pickleball-drop-in"></div>
-</div>
-<input type="hidden" id="venue_slug" name="venue_slug">
-<input type="hidden" id="activity_slug" name="activity_slug">
-<div><label>Session day</label><select name="weekday">{weekday_options}</select></div>
-<div><label>Session time (24h)</label><input name="target_time" placeholder="19:30" pattern="[0-2][0-9]:[0-5][0-9]" required></div>
-<div><label>Days ahead slot opens</label><input name="days_ahead" type="number" value="7" required></div>
-<div><label>Release hour (local, 0-23)</label><input name="release_hour" type="number" value="21" min="0" max="23" required></div>
+<div><label>Venue</label><select id="venue_select" name="venue_slug" required><option value="">Loading venues...</option></select></div>
+<div><label>Activity</label><select id="activity_select" name="activity_slug" required disabled><option value="">Select a venue first</option></select></div>
+<div><label>Session day</label><select id="weekday_select" name="weekday">{weekday_options}</select></div>
+<div><label>Session time (24h)</label><select id="time_select" name="target_time" required disabled><option value="">Select venue, activity &amp; day first</option></select></div>
+<div><label>Days ahead slot opens</label><select name="days_ahead">{days_ahead_options}</select></div>
+<div><label>Release hour (local)</label><select name="release_hour">{release_hour_options}</select></div>
 </div>
 <button type="submit" class="primary">Add target</button>
 </form>
 </div>
 <script>
-function onPairChange() {{
-  var sel = document.getElementById('known_pair');
-  var custom = document.getElementById('custom_slugs');
-  var venueHidden = document.getElementById('venue_slug');
-  var activityHidden = document.getElementById('activity_slug');
-  var venueInput = document.getElementById('venue_slug_input');
-  var activityInput = document.getElementById('activity_slug_input');
-  if (sel.value === '__custom__') {{
-    custom.style.display = 'grid';
-    venueHidden.value = '';
-    activityHidden.value = '';
-  }} else {{
-    custom.style.display = 'none';
-    var parts = sel.value.split('|');
-    venueHidden.value = parts[0] || '';
-    activityHidden.value = parts[1] || '';
+(function() {{
+  var venueSel = document.getElementById('venue_select');
+  var activitySel = document.getElementById('activity_select');
+  var weekdaySel = document.getElementById('weekday_select');
+  var timeSel = document.getElementById('time_select');
+  var TIME_RE = /^([01]\\d|2[0-3]):([0-5]\\d)$/;
+
+  function setPlaceholder(select, text) {{
+    select.innerHTML = '';
+    var opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = text;
+    select.appendChild(opt);
   }}
-}}
-document.getElementById('venue_slug_input') && document.getElementById('venue_slug_input').addEventListener('input', function() {{
-  document.getElementById('venue_slug').value = this.value;
-}});
-document.getElementById('activity_slug_input') && document.getElementById('activity_slug_input').addEventListener('input', function() {{
-  document.getElementById('activity_slug').value = this.value;
-}});
-onPairChange();
+
+  function addManualTimeOption() {{
+    var opt = document.createElement('option');
+    opt.value = '__manual__';
+    opt.textContent = 'Enter time manually...';
+    timeSel.appendChild(opt);
+  }}
+
+  function loadVenues() {{
+    fetch('/api/venues').then(function(r) {{ if (!r.ok) throw new Error(); return r.json(); }})
+      .then(function(venues) {{
+        setPlaceholder(venueSel, 'Select a venue...');
+        venues.forEach(function(v) {{
+          var opt = document.createElement('option');
+          opt.value = v.slug;
+          opt.textContent = v.name;
+          venueSel.appendChild(opt);
+        }});
+      }})
+      .catch(function() {{ setPlaceholder(venueSel, 'Could not load venues - reload to retry'); }});
+  }}
+
+  function loadActivities() {{
+    activitySel.disabled = true;
+    setPlaceholder(activitySel, venueSel.value ? 'Loading activities...' : 'Select a venue first');
+    timeSel.disabled = true;
+    setPlaceholder(timeSel, 'Select venue, activity & day first');
+    if (!venueSel.value) return;
+    fetch('/api/venues/' + encodeURIComponent(venueSel.value) + '/activities')
+      .then(function(r) {{ if (!r.ok) throw new Error(); return r.json(); }})
+      .then(function(activities) {{
+        setPlaceholder(activitySel, 'Select an activity...');
+        var group = null, lastCategory = null;
+        activities.forEach(function(a) {{
+          if (a.category !== lastCategory) {{
+            group = document.createElement('optgroup');
+            group.label = a.category;
+            activitySel.appendChild(group);
+            lastCategory = a.category;
+          }}
+          var opt = document.createElement('option');
+          opt.value = a.slug;
+          opt.textContent = a.name;
+          group.appendChild(opt);
+        }});
+        activitySel.disabled = false;
+      }})
+      .catch(function() {{ setPlaceholder(activitySel, 'Could not load activities - reload to retry'); }});
+  }}
+
+  function loadTimes() {{
+    timeSel.disabled = true;
+    setPlaceholder(timeSel, 'Select venue, activity & day first');
+    if (!venueSel.value || !activitySel.value) return;
+    setPlaceholder(timeSel, 'Loading times...');
+    fetch('/api/venues/' + encodeURIComponent(venueSel.value) + '/activities/' + encodeURIComponent(activitySel.value) + '/times?weekday=' + weekdaySel.value)
+      .then(function(r) {{ if (!r.ok) throw new Error(); return r.json(); }})
+      .then(function(times) {{
+        setPlaceholder(timeSel, times.length ? 'Select a time...' : 'No upcoming slots found');
+        times.forEach(function(t) {{
+          var opt = document.createElement('option');
+          opt.value = t;
+          opt.textContent = t;
+          timeSel.appendChild(opt);
+        }});
+        addManualTimeOption();
+        timeSel.disabled = false;
+      }})
+      .catch(function() {{
+        setPlaceholder(timeSel, 'Could not load times');
+        addManualTimeOption();
+        timeSel.disabled = false;
+      }});
+  }}
+
+  timeSel.addEventListener('change', function() {{
+    if (timeSel.value !== '__manual__') return;
+    var manual = window.prompt('Session time (24h, HH:MM):', '19:30');
+    if (manual && TIME_RE.test(manual)) {{
+      var opt = document.createElement('option');
+      opt.value = manual;
+      opt.textContent = manual + ' (manual)';
+      timeSel.insertBefore(opt, timeSel.lastElementChild);
+      timeSel.value = manual;
+    }} else {{
+      if (manual !== null) window.alert('Enter a time as HH:MM, e.g. 19:30');
+      timeSel.value = '';
+    }}
+  }});
+
+  venueSel.addEventListener('change', function() {{ loadActivities(); }});
+  activitySel.addEventListener('change', loadTimes);
+  weekdaySel.addEventListener('change', loadTimes);
+  loadVenues();
+}})();
 </script>"""
+
+
+@app.get("/api/venues")
+def api_venues() -> list[dict]:
+    try:
+        return _cached_venues()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch venues: {exc}") from exc
+
+
+@app.get("/api/venues/{venue_slug}/activities")
+def api_activities(venue_slug: str) -> list[dict]:
+    try:
+        return _cached_activities(venue_slug)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch activities: {exc}") from exc
+
+
+@app.get("/api/venues/{venue_slug}/activities/{activity_slug}/times")
+def api_times(venue_slug: str, activity_slug: str, weekday: str) -> list[str]:
+    if weekday not in {v for v, _ in WEEKDAYS}:
+        raise HTTPException(status_code=422, detail="weekday must be one of the cron day-of-week values 0-6")
+    return _typical_times(venue_slug, activity_slug, weekday)
 
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     targets = load_config().get("targets", [])
-    return _page(_targets_table(targets) + _add_form(targets))
+    return _page(_targets_table(targets) + _add_form())
 
 
 @app.post("/targets")
@@ -256,10 +400,10 @@ def add_target(
     targets = config.setdefault("targets", [])
 
     def error(msg: str) -> HTMLResponse:
-        return HTMLResponse(_page(_targets_table(targets) + _add_form(targets, msg)))
+        return HTMLResponse(_page(_targets_table(targets) + _add_form(msg)))
 
     if not venue_slug.strip() or not activity_slug.strip():
-        return error("Pick a venue/activity, or fill in the new-venue fields.")
+        return error("Pick a venue and an activity.")
     if not TIME_RE.match(target_time):
         return error("target_time must be HH:MM, 24h")
     if any(t["name"] == name for t in targets):

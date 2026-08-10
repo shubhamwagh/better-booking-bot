@@ -38,6 +38,17 @@ class CartItem(BaseModel):
     price_pence: int
 
 
+class Venue(BaseModel):
+    slug: str
+    name: str
+
+
+class Activity(BaseModel):
+    slug: str
+    name: str
+    category: str  # top-level category name, e.g. "Pickleball"
+
+
 class BetterAPIError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(f"HTTP {status}: {message}")
@@ -76,6 +87,34 @@ class BetterAPI:
         self.membership_user_id = resp["data"]["membership_user"]["id"]
         log.debug("membership_user_id=%s", self.membership_user_id)
         return self.membership_user_id
+
+    # ------------------------------------------------------------------
+    # Venue / activity discovery (no auth required)
+    # ------------------------------------------------------------------
+
+    def list_venues(self) -> list[Venue]:
+        resp = self._get("/activities/venues")
+        return [Venue(slug=v["slug"], name=v["name"]) for v in resp.get("data", [])]
+
+    def list_activities(self, venue_slug: str) -> list[Activity]:
+        resp = self._get(f"/activities/venue/{venue_slug}/categories")
+        activities: list[Activity] = []
+        for cat in resp.get("data", []):
+            if cat["has_children"]:
+                activities.extend(self._category_leaves(venue_slug, cat["slug"], cat["name"]))
+            else:
+                activities.append(Activity(slug=cat["slug"], name=cat["name"], category=cat["name"]))
+        return activities
+
+    def _category_leaves(self, venue_slug: str, category_slug: str, category_name: str) -> list[Activity]:
+        resp = self._get(f"/activities/venue/{venue_slug}/categories/{category_slug}")
+        leaves: list[Activity] = []
+        for child in resp["data"].get("children", []):
+            if child["has_children"]:
+                leaves.extend(self._category_leaves(venue_slug, child["slug"], category_name))
+            else:
+                leaves.append(Activity(slug=child["slug"], name=child["name"], category=category_name))
+        return leaves
 
     # ------------------------------------------------------------------
     # Slots
