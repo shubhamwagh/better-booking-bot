@@ -13,7 +13,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy source
 COPY src/ ./src/
-COPY config.yaml README.md ./
+COPY config.yaml status.json README.md ./
 
 # Install the project itself
 RUN uv sync --frozen --no-dev
