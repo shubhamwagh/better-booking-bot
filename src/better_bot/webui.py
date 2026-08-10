@@ -137,6 +137,7 @@ def _page(body: str) -> str:
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Better Booking Bot</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%232563eb'/%3E%3Cg fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='4' y='5' width='16' height='16' rx='2'/%3E%3Cpath d='M15 3v4M9 3v4M4 10h16'/%3E%3Cpath d='m9 15 2 2 4-4'/%3E%3C/g%3E%3C/svg%3E">
 <style>
 :root {{
   --bg: #f5f6f8; --card: #ffffff; --text: #1c1e21; --muted: #6b7280;
@@ -153,10 +154,23 @@ def _page(body: str) -> str:
   }}
 }}
 * {{ box-sizing: border-box; }}
+html {{ -webkit-text-size-adjust: 100%; }}
 body {{
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   background: var(--bg); color: var(--text);
   max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem;
+}}
+.table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 -0.25rem; padding: 0 0.25rem; }}
+@media (max-width: 640px) {{
+  body {{ padding: 1.5rem 1rem 3rem; }}
+  .card {{ padding: 1rem; }}
+  .grid {{ grid-template-columns: 1fr; }}
+  table {{ font-size: 0.85rem; }}
+  th, td {{ padding: 0.5rem 0.4rem; }}
+  input, select, button {{ font-size: 1rem; }}
+  .actions {{ display: flex; flex-direction: column; gap: 0.4rem; align-items: flex-start; }}
+  form.inline {{ margin-right: 0; width: 100%; }}
+  form.inline button {{ width: 100%; justify-content: center; }}
 }}
 h1 {{ font-size: 1.4rem; margin: 0 0 0.25rem; display: flex; align-items: center; gap: 0.5rem; }}
 h1 .logo {{ color: var(--accent); display: inline-flex; }}
@@ -232,10 +246,12 @@ def _targets_table(targets: list[dict]) -> str:
 </tr>""")
     return f"""<div class="card">
 <h2>{ICON_LIST} Targets</h2>
+<div class="table-wrap">
 <table>
 <tr><th>name</th><th>venue / activity</th><th>time</th><th>opens</th><th>status</th><th></th></tr>
 {''.join(rows)}
 </table>
+</div>
 </div>"""
 
 
