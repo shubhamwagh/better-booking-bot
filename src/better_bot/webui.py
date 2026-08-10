@@ -67,8 +67,8 @@ def _cached_venues() -> list[dict]:
     global _venues_cache
     if _venues_cache is None or time.monotonic() - _venues_cache[0] > _CACHE_TTL_S:
         venues = sorted(
-            ({"slug": v.slug, "name": v.name} for v in _api.list_venues()),
-            key=lambda v: v["name"],
+            ({"slug": v.slug, "name": v.name, "town": v.town} for v in _api.list_venues()),
+            key=lambda v: (v["town"].lower(), v["name"].lower()),
         )
         _venues_cache = (time.monotonic(), venues)
     return _venues_cache[1]
@@ -295,7 +295,7 @@ def _add_form(error: str | None = None) -> str:
         venues.forEach(function(v) {{
           var opt = document.createElement('option');
           opt.value = v.slug;
-          opt.textContent = v.name;
+          opt.textContent = v.town + ' - ' + v.name;
           venueSel.appendChild(opt);
         }});
       }})
