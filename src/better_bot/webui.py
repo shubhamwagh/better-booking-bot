@@ -59,9 +59,13 @@ ICON_EMPTY = _svg('<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M16
 ICON_CHECK = _svg('<circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/>', 15)
 ICON_DASH = _svg('<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>', 15)
 ICON_X = _svg('<circle cx="12" cy="12" r="9"/><path d="m9.5 9.5 5 5m0-5-5 5"/>', 15)
+ICON_EYE = _svg('<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>', 15)
 
-STATUS_ICONS = {"booked": ICON_CHECK, "booked_manually": ICON_CHECK, "no_slot": ICON_DASH, "failed": ICON_X}
-STATUS_LABELS = {"booked": "booked", "booked_manually": "booked (manual)", "no_slot": "no slot found", "failed": "failed"}
+STATUS_ICONS = {"booked": ICON_CHECK, "booked_manually": ICON_CHECK, "watching": ICON_EYE, "no_slot": ICON_DASH, "failed": ICON_X}
+STATUS_LABELS = {
+    "booked": "booked", "booked_manually": "booked (manual)", "watching": "watching for cancellation",
+    "no_slot": "no slot found", "failed": "failed",
+}
 SECURED_STATUSES = {"booked", "booked_manually"}
 
 _api = BetterAPI()  # unauthenticated: only used for the public venue/activity/times lookups below
@@ -247,6 +251,8 @@ button.danger:hover {{ background: var(--danger); color: #fff; border-color: var
 .history-status {{ display: inline-flex; align-items: center; gap: 0.4rem; }}
 .history-status svg {{ flex-shrink: 0; }}
 .history-status.booked {{ color: var(--ok-text); }}
+.history-status.booked_manually {{ color: var(--ok-text); }}
+.history-status.watching {{ color: var(--accent); }}
 .history-status.no_slot {{ color: var(--muted); }}
 .history-status.failed {{ color: var(--danger); }}
 </style></head>

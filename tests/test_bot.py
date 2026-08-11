@@ -9,8 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from better_bot.bot import _wait_for_slot, already_secured, build_parser, load_config, load_status, record_status, run_target
-from better_bot.api import BetterAPIError, Slot
+from better_bot.bot import _wait_for_slot, already_secured, build_parser, load_config, load_status, record_status, run_target, watch_and_book
+from better_bot.api import BetterAPIError, CartItem, OccurrenceDetails, Slot
 from better_bot.checkout import CardDetails
 
 
@@ -107,6 +107,82 @@ def test_run_target_skips_when_already_secured(tmp_path: Path, monkeypatch):
     with patch("better_bot.bot.BetterAPI") as mock_api_cls:
         run_target(target, "user", "pass", CardDetails(cvv="123"))
     mock_api_cls.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# watch_and_book
+# ------------------------------------------------------------------
+
+def _watch_target() -> dict:
+    return {"name": "My Target", "venue_slug": "v", "activity_slug": "a", "target_time": "19:30"}
+
+
+def _mock_api() -> MagicMock:
+    api = MagicMock()
+    api.__enter__.return_value = api
+    api.__exit__.return_value = False
+    return api
+
+
+def test_watch_and_book_stops_if_already_secured(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    session_date = date.today() + timedelta(days=3)
+    record_status("My Target", "booked_manually", session_date, "19:30")
+    with patch("better_bot.bot.BetterAPI") as mock_api_cls:
+        stopped = watch_and_book(_watch_target(), session_date, "user", "pass", CardDetails(cvv="123"))
+    assert stopped is True
+    mock_api_cls.assert_not_called()
+
+
+def test_watch_and_book_stops_and_records_no_slot_when_expired(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    past_date = date.today() - timedelta(days=1)
+    with patch("better_bot.bot.BetterAPI") as mock_api_cls:
+        stopped = watch_and_book(_watch_target(), past_date, "user", "pass", CardDetails(cvv="123"))
+    assert stopped is True
+    mock_api_cls.assert_not_called()
+    assert load_status()["My Target"]["status"] == "no_slot"
+
+
+def test_watch_and_book_keeps_watching_when_no_match(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    session_date = date.today() + timedelta(days=3)
+    api = _mock_api()
+    api.get_slots.return_value = [_make_slot("20:00", "BOOK")]  # different time, no match
+    with patch("better_bot.bot.BetterAPI", return_value=api):
+        stopped = watch_and_book(_watch_target(), session_date, "user", "pass", CardDetails(cvv="123"))
+    assert stopped is False
+
+
+def test_watch_and_book_books_when_cancellation_opens_slot(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    session_date = date.today() + timedelta(days=3)
+    api = _mock_api()
+    api.get_slots.return_value = [_make_slot("19:30", "BOOK")]
+    api.get_occurrence_details.return_value = OccurrenceDetails(ticket_id="t1", pricing_option_id=1)
+    api.cart_add.return_value = CartItem(cart_item_id=1, name="Pickleball", price_pence=315)
+    with patch("better_bot.bot.BetterAPI", return_value=api), \
+         patch("better_bot.bot.complete_checkout", return_value="https://booking-confirmed/1"):
+        stopped = watch_and_book(_watch_target(), session_date, "user", "pass", CardDetails(cvv="123"))
+    assert stopped is True
+    status = load_status()["My Target"]
+    assert status["status"] == "booked"
+    assert status["detail"] == "https://booking-confirmed/1"
+
+
+def test_watch_and_book_keeps_watching_after_checkout_failure(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    session_date = date.today() + timedelta(days=3)
+    api = _mock_api()
+    api.get_slots.return_value = [_make_slot("19:30", "BOOK")]
+    api.get_occurrence_details.return_value = OccurrenceDetails(ticket_id="t1", pricing_option_id=1)
+    api.cart_add.return_value = CartItem(cart_item_id=1, name="Pickleball", price_pence=315)
+    with patch("better_bot.bot.BetterAPI", return_value=api), \
+         patch("better_bot.bot.complete_checkout", side_effect=RuntimeError("checkout boom")):
+        stopped = watch_and_book(_watch_target(), session_date, "user", "pass", CardDetails(cvv="123"))
+    assert stopped is False
+    assert load_status()["My Target"]["status"] == "failed"
+    api.cart_remove.assert_called_once_with(1)
 
 
 # ------------------------------------------------------------------

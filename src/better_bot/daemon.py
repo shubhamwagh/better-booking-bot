@@ -15,19 +15,22 @@ import argparse
 import logging
 import os
 import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 
-from better_bot.bot import run_target
+from better_bot.bot import already_secured, load_status, record_status, run_target, watch_and_book
 from better_bot.checkout import CardDetails
 
 log = logging.getLogger(__name__)
 
 CONFIG_POLL_S = 30
+WATCH_INTERVAL_MINUTES = 3  # cancellation-watch poll cadence - gentle, not a release-time race
 
 
 # ------------------------------------------------------------------
@@ -110,16 +113,20 @@ def _sync_jobs(
         return existing_ids
 
     desired_ids: set[str] = set()
+    enabled_names: set[str] = set()
 
     for target in targets:
         if not target.get("enabled", True):
             continue
 
+        enabled_names.add(target["name"])
         job_id = _job_id(target)
         desired_ids.add(job_id)
 
         if job_id not in existing_ids:
             _add_job(scheduler, job_id, target, username, password, card)
+
+        _resume_watch_if_pending(scheduler, target, username, password, card)
 
     for old_id in existing_ids - desired_ids:
         try:
@@ -127,6 +134,8 @@ def _sync_jobs(
             log.info("Removed job: %s", old_id)
         except Exception:
             pass
+
+    _cleanup_stale_watches(scheduler, enabled_names)
 
     return desired_ids
 
@@ -159,15 +168,112 @@ def _add_job(
         return
 
     scheduler.add_job(
-        func=run_target,
+        func=_run_and_maybe_watch,
         trigger=trigger,
         id=job_id,
         name=target["name"],
-        args=[target, username, password, card],
+        args=[scheduler, target, username, password, card],
         replace_existing=True,
         misfire_grace_time=120,
     )
     log.info("Scheduled '%s'  cron='%s'", target["name"], cron)
+
+
+# ------------------------------------------------------------------
+# Cancellation watch - if the scheduled burst misses, keep polling
+# gently in the background for someone else's cancellation.
+# ------------------------------------------------------------------
+
+def _run_and_maybe_watch(
+    scheduler: BackgroundScheduler,
+    target: dict,
+    username: str,
+    password: str,
+    card: CardDetails,
+) -> None:
+    run_target(target, username, password, card)
+
+    session_date = date.today() + timedelta(days=int(target.get("days_ahead", 7)))
+    entry = load_status().get(target["name"], {})
+    if entry.get("session_date") == session_date.isoformat() and entry.get("status") in ("no_slot", "failed"):
+        _start_watch(scheduler, target, session_date, username, password, card)
+
+
+def _watch_job_id(target: dict, session_date: date) -> str:
+    return f"watch::{target['name']}::{session_date.isoformat()}"
+
+
+def _start_watch(
+    scheduler: BackgroundScheduler,
+    target: dict,
+    session_date: date,
+    username: str,
+    password: str,
+    card: CardDetails,
+) -> None:
+    job_id = _watch_job_id(target, session_date)
+    if scheduler.get_job(job_id):
+        return  # already watching this one
+
+    def _poll() -> None:
+        if watch_and_book(target, session_date, username, password, card):
+            try:
+                scheduler.remove_job(job_id)
+            except Exception:
+                pass
+            log.info("Cancellation watch ended for '%s' (%s)", target["name"], session_date)
+
+    record_status(target["name"], "watching", session_date, target["target_time"], detail="cancellation watch active")
+    scheduler.add_job(
+        func=_poll,
+        trigger=IntervalTrigger(minutes=WATCH_INTERVAL_MINUTES),
+        id=job_id,
+        name=f"watch:{target['name']}",
+        replace_existing=True,
+        misfire_grace_time=120,
+    )
+    log.info(
+        "Started cancellation watch for '%s' -> %s %s (every %sm)",
+        target["name"], session_date, target["target_time"], WATCH_INTERVAL_MINUTES,
+    )
+
+
+def _resume_watch_if_pending(
+    scheduler: BackgroundScheduler,
+    target: dict,
+    username: str,
+    password: str,
+    card: CardDetails,
+) -> None:
+    """Re-attach a watch job after a daemon restart wipes the in-memory scheduler,
+    for a watch that status.json says was still active and hasn't expired."""
+    entry = load_status().get(target["name"])
+    if not entry or entry.get("status") != "watching":
+        return
+    try:
+        session_date = date.fromisoformat(entry["session_date"])
+    except (KeyError, ValueError):
+        return
+    if already_secured(target["name"], session_date):
+        return
+    session_start = datetime.combine(session_date, datetime.strptime(target["target_time"], "%H:%M").time())
+    if datetime.now() >= session_start:
+        return
+    _start_watch(scheduler, target, session_date, username, password, card)
+
+
+def _cleanup_stale_watches(scheduler: BackgroundScheduler, enabled_names: set[str]) -> None:
+    """Stop watching for any target that's since been disabled or deleted."""
+    for job in scheduler.get_jobs():
+        if not job.id.startswith("watch::"):
+            continue
+        target_name = job.id.split("::", 2)[1]
+        if target_name not in enabled_names:
+            try:
+                scheduler.remove_job(job.id)
+                log.info("Stopped cancellation watch for disabled/removed target '%s'", target_name)
+            except Exception:
+                pass
 
 
 def _crontab_dow_to_apscheduler(dow: str) -> str:
