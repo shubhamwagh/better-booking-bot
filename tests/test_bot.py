@@ -9,8 +9,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from better_bot.bot import _wait_for_slot, build_parser, load_config
+from better_bot.bot import _wait_for_slot, already_secured, build_parser, load_config, load_status, record_status, run_target
 from better_bot.api import BetterAPIError, Slot
+from better_bot.checkout import CardDetails
 
 
 # ------------------------------------------------------------------
@@ -54,6 +55,58 @@ def test_load_config_multiple_targets(tmp_path: Path):
     targets = load_config(str(cfg))
     assert len(targets) == 2
     assert targets[1]["enabled"] is False
+
+
+# ------------------------------------------------------------------
+# status.json - record_status / load_status / already_secured
+# ------------------------------------------------------------------
+
+def test_record_and_load_status(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    record_status("My Target", "booked", date(2026, 8, 17), "19:30", detail="ref-123")
+    data = load_status()
+    assert data["My Target"]["status"] == "booked"
+    assert data["My Target"]["session_date"] == "2026-08-17"
+    assert data["My Target"]["detail"] == "ref-123"
+
+
+def test_already_secured_true_for_matching_booked_session(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    record_status("My Target", "booked_manually", date(2026, 8, 17), "19:30")
+    assert already_secured("My Target", date(2026, 8, 17)) is True
+
+
+def test_already_secured_false_for_different_session_date(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    record_status("My Target", "booked", date(2026, 8, 17), "19:30")
+    assert already_secured("My Target", date(2026, 8, 24)) is False
+
+
+def test_already_secured_false_for_unsettled_status(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    record_status("My Target", "failed", date(2026, 8, 17), "19:30")
+    assert already_secured("My Target", date(2026, 8, 17)) is False
+
+
+def test_already_secured_false_when_no_status_file(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    assert already_secured("Nonexistent", date(2026, 8, 17)) is False
+
+
+def test_run_target_skips_when_already_secured(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    target = {
+        "name": "My Target",
+        "venue_slug": "v",
+        "activity_slug": "a",
+        "target_time": "19:30",
+        "days_ahead": 7,
+    }
+    session_date = date.today() + timedelta(days=7)
+    record_status("My Target", "booked_manually", session_date, "19:30")
+    with patch("better_bot.bot.BetterAPI") as mock_api_cls:
+        run_target(target, "user", "pass", CardDetails(cvv="123"))
+    mock_api_cls.assert_not_called()
 
 
 # ------------------------------------------------------------------

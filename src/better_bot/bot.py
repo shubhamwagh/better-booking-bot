@@ -48,20 +48,38 @@ def status_path() -> Path:
     return config_path.parent / "status.json"
 
 
+def load_status() -> dict:
+    path = status_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
 def record_status(name: str, status: str, session_date: date, target_time: str, detail: str = "") -> None:
     path = status_path()
-    try:
-        data = json.loads(path.read_text()) if path.exists() else {}
-    except Exception:
-        data = {}
+    data = load_status()
     data[name] = {
-        "status": status,  # "booked" | "no_slot" | "failed"
+        "status": status,  # "booked" | "booked_manually" | "no_slot" | "failed"
         "session_date": session_date.isoformat(),
         "target_time": target_time,
         "detail": detail,
         "ran_at": datetime.now(timezone.utc).isoformat(),
     }
     path.write_text(json.dumps(data, indent=2))
+
+
+SECURED_STATUSES = {"booked", "booked_manually"}
+
+
+def already_secured(name: str, session_date: date) -> bool:
+    """True if this target's session is already booked (by the bot or manually)."""
+    entry = load_status().get(name)
+    if not entry:
+        return False
+    return entry.get("status") in SECURED_STATUSES and entry.get("session_date") == session_date.isoformat()
 
 
 # ------------------------------------------------------------------
@@ -78,6 +96,10 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
 
     session_date = date.today() + timedelta(days=days_ahead)
     log.info(f"Target: {name} | Date: {session_date} | Time: {target_time}")
+
+    if already_secured(name, session_date):
+        log.info(f"{name}: already secured for {session_date} - skipping")
+        return
 
     try:
         with BetterAPI() as api:
