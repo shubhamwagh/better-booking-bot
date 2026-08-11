@@ -17,7 +17,7 @@ import logging
 import os
 import re
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -60,8 +60,9 @@ ICON_CHECK = _svg('<circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/>', 15
 ICON_DASH = _svg('<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>', 15)
 ICON_X = _svg('<circle cx="12" cy="12" r="9"/><path d="m9.5 9.5 5 5m0-5-5 5"/>', 15)
 
-STATUS_ICONS = {"booked": ICON_CHECK, "no_slot": ICON_DASH, "failed": ICON_X}
-STATUS_LABELS = {"booked": "booked", "no_slot": "no slot found", "failed": "failed"}
+STATUS_ICONS = {"booked": ICON_CHECK, "booked_manually": ICON_CHECK, "no_slot": ICON_DASH, "failed": ICON_X}
+STATUS_LABELS = {"booked": "booked", "booked_manually": "booked (manual)", "no_slot": "no slot found", "failed": "failed"}
+SECURED_STATUSES = {"booked", "booked_manually"}
 
 _api = BetterAPI()  # unauthenticated: only used for the public venue/activity/times lookups below
 
@@ -142,6 +143,10 @@ def load_status() -> dict:
         return json.loads(path.read_text())
     except Exception:
         return {}
+
+
+def save_status(data: dict) -> None:
+    _status_path().write_text(json.dumps(data, indent=2))
 
 
 def build_cron(weekday: str, release_hour: int) -> str:
@@ -275,7 +280,12 @@ def _status_page(targets: list[dict], status: dict) -> str:
     rows = []
     for t in targets:
         name = html.escape(t["name"])
+        url_name = quote(t["name"], safe="")
+        session_date = date.today() + timedelta(days=int(t.get("days_ahead", 7)))
         entry = status.get(t["name"])
+        secured_for_this_session = bool(
+            entry and entry.get("status") in SECURED_STATUSES and entry.get("session_date") == session_date.isoformat()
+        )
         if entry is None:
             result = '<span class="history-status" style="color: var(--muted)">not run yet</span>'
             when = "-"
@@ -287,12 +297,17 @@ def _status_page(targets: list[dict], status: dict) -> str:
             title = f' title="{detail}"' if detail else ""
             result = f'<span class="history-status {key}"{title}>{icon}{label}</span>'
             when = html.escape(_relative_time(entry.get("ran_at", "")))
-        rows.append(f"<tr><td>{name}</td><td>{result}</td><td>{when}</td></tr>")
+        action = (
+            ""
+            if secured_for_this_session
+            else f'<form class="inline" method="post" action="/targets/{url_name}/mark-booked"><button>{ICON_CHECK}mark booked</button></form>'
+        )
+        rows.append(f"<tr><td>{name}</td><td>{result}</td><td>{when}</td><td class=\"actions\">{action}</td></tr>")
     return f"""<div class="card">
 <h2>{ICON_LIST} History</h2>
 <div class="table-wrap">
 <table>
-<tr><th>target</th><th>last result</th><th>when</th></tr>
+<tr><th>target</th><th>last result</th><th>when</th><th></th></tr>
 {''.join(rows)}
 </table>
 </div>
@@ -561,6 +576,24 @@ def delete_target(name: str) -> RedirectResponse:
     config["targets"] = [t for t in config.get("targets", []) if t["name"] != name]
     save_config(config)
     return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/targets/{name}/mark-booked")
+def mark_booked(name: str) -> RedirectResponse:
+    targets = load_config().get("targets", [])
+    target = next((t for t in targets if t["name"] == name), None)
+    if target is not None:
+        session_date = date.today() + timedelta(days=int(target.get("days_ahead", 7)))
+        status = load_status()
+        status[name] = {
+            "status": "booked_manually",
+            "session_date": session_date.isoformat(),
+            "target_time": target["target_time"],
+            "detail": "",
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+        }
+        save_status(status)
+    return RedirectResponse("/status", status_code=HTTP_303_SEE_OTHER)
 
 
 # ------------------------------------------------------------------
