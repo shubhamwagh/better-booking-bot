@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import textwrap
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from better_bot.bot import load_status, record_status
 from better_bot.checkout import CardDetails
-from better_bot.daemon import _job_id, _sync_jobs
+from better_bot.daemon import (
+    _cleanup_stale_watches,
+    _job_id,
+    _resume_watch_if_pending,
+    _run_and_maybe_watch,
+    _start_watch,
+    _sync_jobs,
+    _watch_job_id,
+)
 
 
 # ------------------------------------------------------------------
@@ -127,3 +137,135 @@ def test_sync_jobs_does_not_readd_existing(tmp_path: Path):
     ids = _sync_jobs(scheduler, cfg, existing, "user", "pass", _card())
     assert not scheduler.add_job.called  # no new job added
     assert ids == existing
+
+
+# ------------------------------------------------------------------
+# _watch_job_id
+# ------------------------------------------------------------------
+
+def test_watch_job_id_format():
+    target = {"name": "My Target"}
+    assert _watch_job_id(target, date(2026, 8, 17)) == "watch::My Target::2026-08-17"
+
+
+# ------------------------------------------------------------------
+# _start_watch
+# ------------------------------------------------------------------
+
+def test_start_watch_adds_job_and_records_status(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    scheduler = MagicMock()
+    scheduler.get_job.return_value = None  # not already watching
+    target = {"name": "My Target", "target_time": "19:30"}
+    _start_watch(scheduler, target, date(2026, 8, 17), "user", "pass", _card())
+    assert scheduler.add_job.called
+    kwargs = scheduler.add_job.call_args.kwargs
+    assert kwargs["id"] == "watch::My Target::2026-08-17"
+    status = load_status()
+    assert status["My Target"]["status"] == "watching"
+
+
+def test_start_watch_is_idempotent(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    scheduler = MagicMock()
+    scheduler.get_job.return_value = MagicMock()  # already watching
+    target = {"name": "My Target", "target_time": "19:30"}
+    _start_watch(scheduler, target, date(2026, 8, 17), "user", "pass", _card())
+    assert not scheduler.add_job.called
+
+
+# ------------------------------------------------------------------
+# _cleanup_stale_watches
+# ------------------------------------------------------------------
+
+def test_cleanup_stale_watches_removes_disabled_targets():
+    scheduler = MagicMock()
+    kept_job = MagicMock(id="watch::Still Enabled::2026-08-17")
+    stale_job = MagicMock(id="watch::Now Disabled::2026-08-17")
+    cron_job = MagicMock(id="venue|activity|19:30")
+    scheduler.get_jobs.return_value = [kept_job, stale_job, cron_job]
+    _cleanup_stale_watches(scheduler, {"Still Enabled"})
+    scheduler.remove_job.assert_called_once_with("watch::Now Disabled::2026-08-17")
+
+
+def test_cleanup_stale_watches_noop_when_all_enabled():
+    scheduler = MagicMock()
+    scheduler.get_jobs.return_value = [MagicMock(id="watch::Still Enabled::2026-08-17")]
+    _cleanup_stale_watches(scheduler, {"Still Enabled"})
+    assert not scheduler.remove_job.called
+
+
+# ------------------------------------------------------------------
+# _resume_watch_if_pending
+# ------------------------------------------------------------------
+
+def test_resume_watch_if_pending_restarts_active_watch(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    future_date = date.today() + timedelta(days=3)
+    record_status("My Target", "watching", future_date, "19:30")
+    scheduler = MagicMock()
+    scheduler.get_job.return_value = None
+    target = {"name": "My Target", "target_time": "19:30"}
+    _resume_watch_if_pending(scheduler, target, "user", "pass", _card())
+    assert scheduler.add_job.called
+
+
+def test_resume_watch_if_pending_skips_when_not_watching(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    scheduler = MagicMock()
+    target = {"name": "My Target", "target_time": "19:30"}
+    _resume_watch_if_pending(scheduler, target, "user", "pass", _card())
+    assert not scheduler.add_job.called
+
+
+def test_resume_watch_if_pending_skips_when_already_secured(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    future_date = date.today() + timedelta(days=3)
+    record_status("My Target", "booked", future_date, "19:30")
+    scheduler = MagicMock()
+    target = {"name": "My Target", "target_time": "19:30"}
+    _resume_watch_if_pending(scheduler, target, "user", "pass", _card())
+    assert not scheduler.add_job.called
+
+
+def test_resume_watch_if_pending_skips_when_expired(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    past_date = date.today() - timedelta(days=1)
+    record_status("My Target", "watching", past_date, "19:30")
+    scheduler = MagicMock()
+    target = {"name": "My Target", "target_time": "19:30"}
+    _resume_watch_if_pending(scheduler, target, "user", "pass", _card())
+    assert not scheduler.add_job.called
+
+
+# ------------------------------------------------------------------
+# _run_and_maybe_watch
+# ------------------------------------------------------------------
+
+def test_run_and_maybe_watch_starts_watch_on_miss(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    target = {"name": "My Target", "target_time": "19:30", "days_ahead": 7}
+    session_date = date.today() + timedelta(days=7)
+
+    def fake_run_target(t, u, p, c):
+        record_status("My Target", "no_slot", session_date, "19:30")
+
+    scheduler = MagicMock()
+    scheduler.get_job.return_value = None
+    with patch("better_bot.daemon.run_target", side_effect=fake_run_target):
+        _run_and_maybe_watch(scheduler, target, "user", "pass", _card())
+    assert scheduler.add_job.called
+
+
+def test_run_and_maybe_watch_no_watch_when_booked(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    target = {"name": "My Target", "target_time": "19:30", "days_ahead": 7}
+    session_date = date.today() + timedelta(days=7)
+
+    def fake_run_target(t, u, p, c):
+        record_status("My Target", "booked", session_date, "19:30", detail="ref-1")
+
+    scheduler = MagicMock()
+    with patch("better_bot.daemon.run_target", side_effect=fake_run_target):
+        _run_and_maybe_watch(scheduler, target, "user", "pass", _card())
+    assert not scheduler.add_job.called

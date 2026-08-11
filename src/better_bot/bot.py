@@ -86,6 +86,55 @@ def already_secured(name: str, session_date: date) -> bool:
 # Core booking flow
 # ------------------------------------------------------------------
 
+def _book_slot(
+    api: BetterAPI,
+    target: dict,
+    slot: Slot,
+    session_date: date,
+    card: CardDetails,
+    headless: bool = True,
+) -> None:
+    """Occurrence details -> cart -> checkout for an already-found slot.
+
+    Shared by run_target's initial burst and the cancellation watch's poll -
+    both just need "we found a bookable slot, now actually get it".
+    """
+    name = target["name"]
+    target_time = target["target_time"]
+
+    log.info(f"Slot found: {slot.id} spaces={slot.spaces}")
+    occurrence = api.get_occurrence_details(slot.id)
+
+    cart_item = api.cart_add(slot, occurrence)
+    log.info(f"Added to cart: {cart_item.name}  £{cart_item.price_pence / 100:.2f}")
+
+    try:
+        ref = complete_checkout(card=card, token=api._token, headless=headless)  # noqa: SLF001
+        log.info(f"Booking complete: {ref}")
+        notify(
+            subject=f"Booked: {name}",
+            body=(
+                f"Booking confirmed!\n\n"
+                f"Activity: {name}\n"
+                f"Session:  {session_date} {target_time}\n"
+                f"Price:    £{cart_item.price_pence / 100:.2f}\n"
+                f"Ref:      {ref}"
+            ),
+        )
+        record_status(name, "booked", session_date, target_time, detail=ref)
+    except Exception as exc:
+        try:
+            api.cart_remove(cart_item.cart_item_id)
+        except Exception:
+            pass
+        log.error(f"Checkout failed: {exc}")
+        notify(
+            subject=f"Booking failed: {name}",
+            body=f"Checkout failed for {name} on {session_date} {target_time}.\n\nError: {exc}",
+        )
+        raise
+
+
 def run_target(target: dict, username: str, password: str, card: CardDetails, headless: bool = True) -> None:
     name = target["name"]
     venue = target["venue_slug"]
@@ -103,12 +152,9 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
 
     try:
         with BetterAPI() as api:
-            # 1. Login
             api.login(username, password)
-            token = api._token  # noqa: SLF001  - needed for checkout browser session
             api.fetch_membership_user_id()
 
-            # 2. Poll until slot opens
             slot = _wait_for_slot(api, venue, activity, session_date, target_time, release_hour)
 
             if slot is None:
@@ -120,43 +166,58 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
                 record_status(name, "no_slot", session_date, target_time)
                 return
 
-            # 3. Get occurrence details
-            log.info(f"Slot found: {slot.id} spaces={slot.spaces}")
-            occurrence = api.get_occurrence_details(slot.id)
-
-            # 4. Add to cart
-            cart_item = api.cart_add(slot, occurrence)
-            log.info(f"Added to cart: {cart_item.name}  £{cart_item.price_pence / 100:.2f}")
-
-            # 5. Complete checkout - auto-detects credit/saved-card/new-card from page
-            try:
-                ref = complete_checkout(card=card, token=token, headless=headless)
-                log.info(f"Booking complete: {ref}")
-                notify(
-                    subject=f"Booked: {name}",
-                    body=(
-                        f"Booking confirmed!\n\n"
-                        f"Activity: {name}\n"
-                        f"Session:  {session_date} {target_time}\n"
-                        f"Price:    £{cart_item.price_pence / 100:.2f}\n"
-                        f"Ref:      {ref}"
-                    ),
-                )
-                record_status(name, "booked", session_date, target_time, detail=ref)
-            except Exception as exc:
-                try:
-                    api.cart_remove(cart_item.cart_item_id)
-                except Exception:
-                    pass
-                log.error(f"Checkout failed: {exc}")
-                notify(
-                    subject=f"Booking failed: {name}",
-                    body=f"Checkout failed for {name} on {session_date} {target_time}.\n\nError: {exc}",
-                )
-                raise
+            _book_slot(api, target, slot, session_date, card, headless)
     except Exception as exc:
         record_status(name, "failed", session_date, target_time, detail=str(exc))
         raise
+
+
+# ------------------------------------------------------------------
+# Cancellation watch - after an initial miss, keep checking (gently)
+# for someone else's cancellation to open the same slot back up.
+# ------------------------------------------------------------------
+
+def watch_and_book(
+    target: dict,
+    session_date: date,
+    username: str,
+    password: str,
+    card: CardDetails,
+    headless: bool = True,
+) -> bool:
+    """One poll of an active cancellation watch. Returns True once the watch
+    should stop - either the target got secured (by this poll, or manually
+    via the web UI in the meantime) or the session's own start time has
+    already passed.
+    """
+    name = target["name"]
+    target_time = target["target_time"]
+
+    if already_secured(name, session_date):
+        return True
+
+    session_start = datetime.combine(session_date, datetime.strptime(target_time, "%H:%M").time())
+    if datetime.now() >= session_start:
+        log.info(f"{name}: cancellation watch expired for {session_date} {target_time}")
+        record_status(name, "no_slot", session_date, target_time, detail="cancellation watch expired unfilled")
+        return True
+
+    try:
+        with BetterAPI() as api:
+            api.login(username, password)
+            api.fetch_membership_user_id()
+            slots = api.get_slots(target["venue_slug"], target["activity_slug"], session_date)
+            match = next((s for s in slots if s.starts_at == target_time and s.status == "BOOK"), None)
+            if match is None:
+                return False
+            log.info(f"{name}: cancellation watch found an opening for {session_date} {target_time}")
+            _book_slot(api, target, match, session_date, card, headless)
+    except Exception as exc:
+        log.warning(f"{name}: cancellation watch attempt failed, still watching: {exc}")
+        record_status(name, "failed", session_date, target_time, detail=str(exc))
+        return False
+
+    return already_secured(name, session_date)
 
 
 # ------------------------------------------------------------------
