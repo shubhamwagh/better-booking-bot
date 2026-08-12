@@ -189,18 +189,18 @@ def _has_saved_card(page: Page) -> bool:
 
 
 def _apply_full_credit(page: Page) -> None:
-    """Click 'Use full credit balance' and wait for the page to update."""
+    """Click 'Pay full amount using credit' and wait for the page to update."""
     try:
-        btn = page.locator('button:has-text("Use full credit balance")').first
+        btn = page.locator('button:has-text("Pay full amount using credit")').first
         if btn.is_visible(timeout=5_000):
             btn.click()
-            log.debug("Clicked 'Use full credit balance'")
+            log.debug("Clicked 'Pay full amount using credit'")
             # Wait for page to reflect updated total (network idle or URL change)
             page.wait_for_load_state("networkidle", timeout=10_000)
             time.sleep(1)
             return
     except Exception as exc:
-        log.debug(f"'Use full credit balance' button not found or click failed: {exc}")
+        log.debug(f"'Pay full amount using credit' button not found or click failed: {exc}")
     log.debug("Credit may already be applied or button not present")
 
 
