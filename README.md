@@ -1,5 +1,10 @@
 # better-booking-bot
 
+[![CI](https://github.com/shubhamwagh/better-booking-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/shubhamwagh/better-booking-bot/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/shubhamwagh/better-booking-bot)](https://github.com/shubhamwagh/better-booking-bot/releases)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 Automated activity booking bot for [Better (GLL)](https://www.better.org.uk) leisure centres.
 
 Monitors slot availability, applies account credit, and completes payment automatically - via saved card, new card, or credit-only.
