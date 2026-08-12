@@ -16,16 +16,17 @@ import logging
 import os
 import time
 from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from dotenv import load_dotenv
 
 from better_bot.bot import already_secured, load_status, record_status, run_target, watch_and_book
 from better_bot.checkout import CardDetails
+from better_bot.settings import Settings
 
 log = logging.getLogger(__name__)
 
@@ -33,9 +34,36 @@ CONFIG_POLL_S = 30
 WATCH_INTERVAL_MINUTES = 3  # cancellation-watch poll cadence - gentle, not a release-time race
 
 
+def log_path() -> Path:
+    """Where the daemon's log file lives, so the web UI's Logs tab can tail it.
+
+    Defaults next to config.yaml (same shared-volume convention as status.json);
+    override with LOG_PATH if the two need to live in different places.
+    """
+    override = os.getenv("LOG_PATH")
+    if override:
+        return Path(override)
+    config_path = Path(os.getenv("CONFIG_PATH", "config.yaml"))
+    return config_path.parent / "logs" / "daemon.log"
+
+
+def _configure_logging(verbose: bool) -> None:
+    path = log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            RotatingFileHandler(path, maxBytes=2_000_000, backupCount=3),
+        ],
+    )
+
+
 # ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Better booking bot - daemon scheduler")
@@ -43,28 +71,12 @@ def main() -> None:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-    )
+    _configure_logging(args.verbose)
 
-    load_dotenv()
-
-    username = os.environ["BETTER_USERNAME"]
-    password = os.environ["BETTER_PASSWORD"]
-    cvv = os.environ.get("CARD_CVV") or ""
-    card = CardDetails(
-        cvv=cvv,
-        number=os.getenv("CARD_NUMBER"),
-        expiry=os.getenv("CARD_EXPIRY"),
-        first_name=os.getenv("BILLING_FIRST_NAME"),
-        last_name=os.getenv("BILLING_LAST_NAME"),
-        address1=os.getenv("BILLING_ADDRESS1"),
-        address2=os.getenv("BILLING_ADDRESS2"),
-        city=os.getenv("BILLING_CITY"),
-        postcode=os.getenv("BILLING_POSTCODE"),
-        save_card=os.getenv("SAVE_CARD", "false").lower() in ("1", "true", "yes"),
-    )
+    settings = Settings()
+    username = settings.better_username
+    password = settings.better_password
+    card = settings.to_card()
 
     config_path = Path(args.config or os.getenv("CONFIG_PATH", "config.yaml"))
 
@@ -81,8 +93,12 @@ def main() -> None:
             if mtime != last_mtime:
                 log.info("Config changed - reloading %s", config_path)
                 current_job_ids = _sync_jobs(
-                    scheduler, config_path, current_job_ids,
-                    username, password, card,
+                    scheduler,
+                    config_path,
+                    current_job_ids,
+                    username,
+                    password,
+                    card,
                 )
                 last_mtime = mtime
             time.sleep(CONFIG_POLL_S)
@@ -95,6 +111,7 @@ def main() -> None:
 # ------------------------------------------------------------------
 # Job sync
 # ------------------------------------------------------------------
+
 
 def _sync_jobs(
     scheduler: BackgroundScheduler,
@@ -184,6 +201,7 @@ def _add_job(
 # gently in the background for someone else's cancellation.
 # ------------------------------------------------------------------
 
+
 def _run_and_maybe_watch(
     scheduler: BackgroundScheduler,
     target: dict,
@@ -234,7 +252,10 @@ def _start_watch(
     )
     log.info(
         "Started cancellation watch for '%s' -> %s %s (every %sm)",
-        target["name"], session_date, target["target_time"], WATCH_INTERVAL_MINUTES,
+        target["name"],
+        session_date,
+        target["target_time"],
+        WATCH_INTERVAL_MINUTES,
     )
 
 
@@ -281,6 +302,7 @@ def _crontab_dow_to_apscheduler(dow: str) -> str:
     day_of_week convention (0=Mon..6=Sun). Named/wildcard tokens pass through
     unchanged since APScheduler's own names already match its convention.
     """
+
     def convert(token: str) -> str:
         base, _, step = token.partition("/")
         if "-" in base:

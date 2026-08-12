@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import pytest
 import httpx
+import pytest
 import respx
+from pydantic import ValidationError
 
 from better_bot.api import (
     BetterAPI,
@@ -21,6 +22,7 @@ BASE = "https://better-admin.org.uk/api"
 # Pydantic model tests
 # ------------------------------------------------------------------
 
+
 class TestSlot:
     def test_basic(self):
         s = Slot(id="abc", starts_at="19:30", status="BOOK", spaces=3, composite_key="ck")
@@ -28,8 +30,9 @@ class TestSlot:
         assert s.spaces == 3
 
     def test_invalid_missing_field(self):
-        with pytest.raises(Exception):
-            Slot(id="x", starts_at="10:00", status="BOOK", spaces=2)  # missing composite_key
+        # missing composite_key
+        with pytest.raises(ValidationError):
+            Slot(id="x", starts_at="10:00", status="BOOK", spaces=2)  # ty: ignore[missing-argument]
 
 
 class TestOccurrenceDetails:
@@ -48,11 +51,10 @@ class TestCartItem:
 # BetterAPI tests (mocked httpx via respx)
 # ------------------------------------------------------------------
 
+
 @respx.mock
 def test_login_sets_token():
-    respx.post(f"{BASE}/auth/customer/login").mock(
-        return_value=httpx.Response(200, json={"token": "tok123"})
-    )
+    respx.post(f"{BASE}/auth/customer/login").mock(return_value=httpx.Response(200, json={"token": "tok123"}))
     api = BetterAPI()
     api.login("user@example.com", "pass")
     assert api._token == "tok123"
@@ -62,9 +64,7 @@ def test_login_sets_token():
 
 @respx.mock
 def test_login_401_raises():
-    respx.post(f"{BASE}/auth/customer/login").mock(
-        return_value=httpx.Response(401, json={"message": "Unauthorized"})
-    )
+    respx.post(f"{BASE}/auth/customer/login").mock(return_value=httpx.Response(401, json={"message": "Unauthorized"}))
     api = BetterAPI()
     with pytest.raises(BetterAPIError) as exc_info:
         api.login("bad@example.com", "wrong")
@@ -105,6 +105,7 @@ def test_get_slots_returns_parsed_slots():
         ]
     }
     from datetime import date
+
     respx.get(f"{BASE}/activities/venue/venue-a/activity/act-b/v2/times").mock(
         return_value=httpx.Response(200, json=payload)
     )
@@ -138,6 +139,7 @@ def test_get_slots_skips_malformed_entry():
         ]
     }
     from datetime import date
+
     respx.get(f"{BASE}/activities/venue/venue-a/activity/act-b/v2/times").mock(
         return_value=httpx.Response(200, json=payload)
     )
@@ -151,6 +153,7 @@ def test_get_slots_skips_malformed_entry():
 @respx.mock
 def test_get_slots_422_returns_empty():
     from datetime import date
+
     respx.get(f"{BASE}/activities/venue/v/activity/a/v2/times").mock(
         return_value=httpx.Response(422, json={"message": "Not yet released"})
     )
@@ -163,11 +166,7 @@ def test_get_slots_422_returns_empty():
 @respx.mock
 def test_get_occurrence_details():
     respx.get(f"{BASE}/v1/activities/occurrences/slot-1").mock(
-        return_value=httpx.Response(200, json={
-            "data": {
-                "tickets": [{"id": "t99", "pricing_option": {"id": 7}}]
-            }
-        })
+        return_value=httpx.Response(200, json={"data": {"tickets": [{"id": "t99", "pricing_option": {"id": 7}}]}})
     )
     api = BetterAPI()
     occ = api.get_occurrence_details("slot-1")
@@ -178,15 +177,11 @@ def test_get_occurrence_details():
 
 @respx.mock
 def test_cart_add_returns_cart_item():
-    respx.get(f"{BASE}/auth/user").mock(
-        return_value=httpx.Response(200, json={"data": {"membership_user": {"id": 1}}})
-    )
+    respx.get(f"{BASE}/auth/user").mock(return_value=httpx.Response(200, json={"data": {"membership_user": {"id": 1}}}))
     respx.post(f"{BASE}/activities/cart/add").mock(
-        return_value=httpx.Response(200, json={
-            "data": {
-                "items": [{"id": 55, "name": "Pickleball Drop-in", "price": {"raw": 600}}]
-            }
-        })
+        return_value=httpx.Response(
+            200, json={"data": {"items": [{"id": 55, "name": "Pickleball Drop-in", "price": {"raw": 600}}]}}
+        )
     )
     api = BetterAPI()
     api.fetch_membership_user_id()
@@ -210,9 +205,7 @@ def test_cart_add_without_membership_raises():
 
 @respx.mock
 def test_handle_500_raises():
-    respx.get(f"{BASE}/auth/user").mock(
-        return_value=httpx.Response(500, text="Internal Server Error")
-    )
+    respx.get(f"{BASE}/auth/user").mock(return_value=httpx.Response(500, text="Internal Server Error"))
     api = BetterAPI()
     with pytest.raises(BetterAPIError) as exc_info:
         api.fetch_membership_user_id()

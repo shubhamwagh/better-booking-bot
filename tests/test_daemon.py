@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import textwrap
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from better_bot.bot import load_status, record_status
 from better_bot.checkout import CardDetails
@@ -21,10 +19,10 @@ from better_bot.daemon import (
     _watch_job_id,
 )
 
-
 # ------------------------------------------------------------------
 # _job_id
 # ------------------------------------------------------------------
+
 
 def test_job_id_format():
     target = {
@@ -45,13 +43,15 @@ def test_job_id_unique_per_time():
 # _sync_jobs
 # ------------------------------------------------------------------
 
+
 def _card() -> CardDetails:
     return CardDetails(cvv="123")
 
 
 def test_sync_jobs_adds_new_job(tmp_path: Path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text(textwrap.dedent("""\
+    cfg.write_text(
+        textwrap.dedent("""\
         targets:
           - name: "Test"
             venue_slug: "v"
@@ -59,7 +59,8 @@ def test_sync_jobs_adds_new_job(tmp_path: Path):
             target_time: "19:30"
             cron: "57 20 * * 1"
             enabled: true
-    """))
+    """)
+    )
     scheduler = MagicMock()
     ids = _sync_jobs(scheduler, cfg, set(), "user", "pass", _card())
     assert scheduler.add_job.called
@@ -68,7 +69,8 @@ def test_sync_jobs_adds_new_job(tmp_path: Path):
 
 def test_sync_jobs_skips_disabled(tmp_path: Path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text(textwrap.dedent("""\
+    cfg.write_text(
+        textwrap.dedent("""\
         targets:
           - name: "Test"
             venue_slug: "v"
@@ -76,7 +78,8 @@ def test_sync_jobs_skips_disabled(tmp_path: Path):
             target_time: "19:30"
             cron: "57 20 * * 1"
             enabled: false
-    """))
+    """)
+    )
     scheduler = MagicMock()
     ids = _sync_jobs(scheduler, cfg, set(), "user", "pass", _card())
     assert not scheduler.add_job.called
@@ -95,14 +98,16 @@ def test_sync_jobs_removes_old_job(tmp_path: Path):
 
 def test_sync_jobs_skips_missing_cron(tmp_path: Path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text(textwrap.dedent("""\
+    cfg.write_text(
+        textwrap.dedent("""\
         targets:
           - name: "No Cron"
             venue_slug: "v"
             activity_slug: "a"
             target_time: "10:00"
             enabled: true
-    """))
+    """)
+    )
     scheduler = MagicMock()
     ids = _sync_jobs(scheduler, cfg, set(), "user", "pass", _card())
     # job_id enters desired set but scheduler.add_job is never called (no cron)
@@ -123,7 +128,8 @@ def test_sync_jobs_invalid_config_returns_existing(tmp_path: Path):
 
 def test_sync_jobs_does_not_readd_existing(tmp_path: Path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text(textwrap.dedent("""\
+    cfg.write_text(
+        textwrap.dedent("""\
         targets:
           - name: "Test"
             venue_slug: "v"
@@ -131,7 +137,8 @@ def test_sync_jobs_does_not_readd_existing(tmp_path: Path):
             target_time: "19:30"
             cron: "57 20 * * 1"
             enabled: true
-    """))
+    """)
+    )
     scheduler = MagicMock()
     existing = {"v|a|19:30"}  # already scheduled
     ids = _sync_jobs(scheduler, cfg, existing, "user", "pass", _card())
@@ -143,6 +150,7 @@ def test_sync_jobs_does_not_readd_existing(tmp_path: Path):
 # _watch_job_id
 # ------------------------------------------------------------------
 
+
 def test_watch_job_id_format():
     target = {"name": "My Target"}
     assert _watch_job_id(target, date(2026, 8, 17)) == "watch::My Target::2026-08-17"
@@ -151,6 +159,7 @@ def test_watch_job_id_format():
 # ------------------------------------------------------------------
 # _start_watch
 # ------------------------------------------------------------------
+
 
 def test_start_watch_adds_job_and_records_status(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
@@ -178,6 +187,7 @@ def test_start_watch_is_idempotent(tmp_path: Path, monkeypatch):
 # _cleanup_stale_watches
 # ------------------------------------------------------------------
 
+
 def test_cleanup_stale_watches_removes_disabled_targets():
     scheduler = MagicMock()
     kept_job = MagicMock(id="watch::Still Enabled::2026-08-17")
@@ -198,6 +208,7 @@ def test_cleanup_stale_watches_noop_when_all_enabled():
 # ------------------------------------------------------------------
 # _resume_watch_if_pending
 # ------------------------------------------------------------------
+
 
 def test_resume_watch_if_pending_restarts_active_watch(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
@@ -241,6 +252,7 @@ def test_resume_watch_if_pending_skips_when_expired(tmp_path: Path, monkeypatch)
 # ------------------------------------------------------------------
 # _run_and_maybe_watch
 # ------------------------------------------------------------------
+
 
 def test_run_and_maybe_watch_starts_watch_on_miss(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))

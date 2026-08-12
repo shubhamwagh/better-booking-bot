@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from playwright.sync_api import Frame, Page, expect, sync_playwright
 from pydantic import BaseModel
@@ -26,8 +27,8 @@ log = logging.getLogger(__name__)
 
 class CardDetails(BaseModel):
     cvv: str
-    number: str | None = None     # set to use new-card mode
-    expiry: str | None = None     # MM/YY or MM/YYYY
+    number: str | None = None  # set to use new-card mode
+    expiry: str | None = None  # MM/YY or MM/YYYY
     # Billing address - required for new card mode
     first_name: str | None = None
     last_name: str | None = None
@@ -80,18 +81,20 @@ def complete_checkout(
                 viewport={"width": 1920, "height": 1080},
             )
             # Hide navigator.webdriver to bypass Opayo bot detection
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            context.add_cookies(
+                [
+                    {
+                        "name": "better.org.uk-authToken",
+                        "value": f'"{token}"',
+                        "domain": "bookings.better.org.uk",
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": False,
+                        "sameSite": "Lax",
+                    }
+                ]
             )
-            context.add_cookies([{
-                "name": "better.org.uk-authToken",
-                "value": f'"{token}"',
-                "domain": "bookings.better.org.uk",
-                "path": "/",
-                "secure": True,
-                "httpOnly": False,
-                "sameSite": "Lax",
-            }])
             page = context.new_page()
             _block_analytics(page)
 
@@ -115,9 +118,7 @@ def complete_checkout(
             else:
                 log.info("No saved card - entering new card details")
                 if not card.number or not card.expiry:
-                    raise RuntimeError(
-                        "No saved card found. Set CARD_NUMBER and CARD_EXPIRY in .env for new card mode"
-                    )
+                    raise RuntimeError("No saved card found. Set CARD_NUMBER and CARD_EXPIRY in .env for new card mode")
                 _select_new_card(page)
                 _fill_billing_details(page, card)
                 _fill_opayo_iframe(page, card)
@@ -147,6 +148,7 @@ def complete_checkout(
 # ------------------------------------------------------------------
 # Credit helpers
 # ------------------------------------------------------------------
+
 
 def _is_zero_balance(page: Page) -> bool:
     """Return True if the total to pay is £0 after credit was applied."""
@@ -206,6 +208,7 @@ def _apply_full_credit(page: Page) -> None:
 # Payment mode helpers
 # ------------------------------------------------------------------
 
+
 def _select_saved_card(page: Page) -> None:
     """Click the saved card radio button."""
     for selector in [
@@ -250,12 +253,12 @@ def _fill_saved_card_cvv(page: Page, cvv: str) -> None:
 def _fill_billing_details(page: Page, card: CardDetails) -> None:
     """Fill First name, Last name, Address, Town/city, Postcode for new card mode."""
     fields = [
-        (card.first_name, ['input[id="billingFirstName"]',       'input[name="billingFirstName"]']),
-        (card.last_name,  ['input[id="billingLastName"]',        'input[name="billingLastName"]']),
-        (card.address1,   ['input[name="billingAddressLineOne"]', 'input[id="billingAddressLineOne"]']),
-        (card.address2,   ['input[id="billingAddressLineTwo"]',  'input[name="billingAddressLineTwo"]']),
-        (card.city,       ['input[id="billingAddressCity"]',     'input[name="billingCity"]']),
-        (card.postcode,   ['input[id="billingAddressPostcode"]', 'input[name="billingPostcode"]']),
+        (card.first_name, ['input[id="billingFirstName"]', 'input[name="billingFirstName"]']),
+        (card.last_name, ['input[id="billingLastName"]', 'input[name="billingLastName"]']),
+        (card.address1, ['input[name="billingAddressLineOne"]', 'input[id="billingAddressLineOne"]']),
+        (card.address2, ['input[id="billingAddressLineTwo"]', 'input[name="billingAddressLineTwo"]']),
+        (card.city, ['input[id="billingAddressCity"]', 'input[name="billingCity"]']),
+        (card.postcode, ['input[id="billingAddressPostcode"]', 'input[name="billingPostcode"]']),
     ]
     for value, selectors in fields:
         if not value:
@@ -302,8 +305,7 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
     log.debug("Waiting for Opayo iframe to load...")
     try:
         page.wait_for_function(
-            "() => { const f = document.querySelector('iframe'); "
-            "return f && f.src && f.src !== 'about:blank'; }",
+            "() => { const f = document.querySelector('iframe'); return f && f.src && f.src !== 'about:blank'; }",
             timeout=30_000,
         )
         log.debug("Iframe src populated")
@@ -323,34 +325,54 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
 
     cardholder_name = " ".join(filter(None, [card.first_name, card.last_name])) or None
     if cardholder_name:
-        _type_in_frame(opayo, cardholder_name, [
-            'input[name="cardholder-name"]',
-            'input[id="cardholder-name"]',
-            'input[autocomplete="cc-name"]',
-            'input[placeholder*="Name"]',
-            'input[placeholder*="name"]',
-        ], "cardholder name")
+        _type_in_frame(
+            opayo,
+            cardholder_name,
+            [
+                'input[name="cardholder-name"]',
+                'input[id="cardholder-name"]',
+                'input[autocomplete="cc-name"]',
+                'input[placeholder*="Name"]',
+                'input[placeholder*="name"]',
+            ],
+            "cardholder name",
+        )
 
     if card.number:
-        _type_in_frame(opayo, card.number, [
-            'input[name="card-number"]',
-            'input[id="card-number"]',
-            'input[autocomplete="cc-number"]',
-        ], "card number")
+        _type_in_frame(
+            opayo,
+            card.number,
+            [
+                'input[name="card-number"]',
+                'input[id="card-number"]',
+                'input[autocomplete="cc-number"]',
+            ],
+            "card number",
+        )
 
     if card.expiry:
-        _type_in_frame(opayo, card.expiry, [
-            'input[name="expiry-date"]',
-            'input[id="expiry-date"]',
-            'input[autocomplete="cc-exp"]',
-        ], "expiry")
+        _type_in_frame(
+            opayo,
+            card.expiry,
+            [
+                'input[name="expiry-date"]',
+                'input[id="expiry-date"]',
+                'input[autocomplete="cc-exp"]',
+            ],
+            "expiry",
+        )
 
-    _type_in_frame(opayo, card.cvv, [
-        'input[name="security-code"]',
-        'input[id="security-code"]',
-        'input[autocomplete="cc-csc"]',
-        'input[placeholder*="CV"]',
-    ], "CVV")
+    _type_in_frame(
+        opayo,
+        card.cvv,
+        [
+            'input[name="security-code"]',
+            'input[id="security-code"]',
+            'input[autocomplete="cc-csc"]',
+            'input[placeholder*="CV"]',
+        ],
+        "CVV",
+    )
 
     if card.save_card:
         try:
@@ -362,7 +384,6 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
             pass
 
 
-
 def _find_opayo_frame(page: Page) -> Frame | None:
     for frame in page.frames:
         url = frame.url
@@ -371,7 +392,7 @@ def _find_opayo_frame(page: Page) -> Frame | None:
     return None
 
 
-def _type_in_frame(frame_loc: any, value: str, selectors: list[str], label: str) -> None:
+def _type_in_frame(frame_loc: Any, value: str, selectors: list[str], label: str) -> None:
     """Type value into first matching selector inside a frame_locator."""
     for selector in selectors:
         try:
@@ -415,6 +436,7 @@ def _type_field(frame: Frame, value: str, selectors: list[str], label: str) -> N
 # ------------------------------------------------------------------
 # Confirmation polling
 # ------------------------------------------------------------------
+
 
 def _wait_for_confirmation(page: Page, timeout_s: int) -> str:
     deadline = time.time() + timeout_s
@@ -461,6 +483,7 @@ def _extract_reference(page: Page) -> str:
 # Page helpers
 # ------------------------------------------------------------------
 
+
 def _accept_terms_inline(page: Page) -> None:
     """Check the inline T&Cs checkbox on the checkout page (pre-pay step).
 
@@ -471,7 +494,7 @@ def _accept_terms_inline(page: Page) -> None:
         'input[type="checkbox"][id*="terms"]',
         'input[type="checkbox"][name*="terms"]',
         'label:has-text("Terms and Conditions") input[type="checkbox"]',
-        'input[type="checkbox"]',   # last-resort: any checkbox on page
+        'input[type="checkbox"]',  # last-resort: any checkbox on page
     ]:
         try:
             cb = page.locator(selector).first

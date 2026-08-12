@@ -9,10 +9,14 @@ services:
       - ./config.yaml:/app/config.yaml:ro
       # read-write: better-bot records the last-run result of each target here
       - ./status.json:/app/status.json
+      # read-write: better-bot writes its log here; the web UI's Logs tab tails it
+      - ./logs:/app/logs
 
   webui:
     image: ghcr.io/shubhamwagh/better-booking-bot:latest
     restart: unless-stopped
+    # needed for the History page's "cancel booking" action, which logs in to cancel for real
+    env_file: .env
     entrypoint: ["python", "-m", "better_bot.webui"]
     ports:
       - "8080:8080"
@@ -21,3 +25,5 @@ services:
       - ./config.yaml:/app/config.yaml
       # read-only: the web UI's History page reads this, better-bot writes it
       - ./status.json:/app/status.json:ro
+      # read-only: the web UI's Logs tab tails this, better-bot writes it
+      - ./logs:/app/logs:ro

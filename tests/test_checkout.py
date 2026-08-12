@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from better_bot.checkout import CardDetails
 
@@ -49,8 +50,9 @@ class TestCardDetails:
         assert c.postcode is None
 
     def test_missing_cvv_raises(self):
-        with pytest.raises(Exception):
-            CardDetails()  # cvv is required
+        # cvv is required
+        with pytest.raises(ValidationError):
+            CardDetails()  # ty: ignore[missing-argument]
 
     def test_cvv_is_required_field(self):
         assert CardDetails.model_fields["cvv"].is_required()

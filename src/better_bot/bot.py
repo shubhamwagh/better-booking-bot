@@ -13,15 +13,16 @@ import logging
 import os
 import sys
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
 
 from better_bot.api import BetterAPI, BetterAPIError, Slot
 from better_bot.checkout import CardDetails, complete_checkout
 from better_bot.notify import send as notify
+from better_bot.settings import Settings
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ log = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # Config loading
 # ------------------------------------------------------------------
+
 
 def load_config(path: str | None = None) -> list[dict]:
     config_path = Path(path or os.getenv("CONFIG_PATH", "config.yaml"))
@@ -43,9 +45,23 @@ def load_config(path: str | None = None) -> list[dict]:
 # same shared volume with no extra deployment config.
 # ------------------------------------------------------------------
 
+
 def status_path() -> Path:
     config_path = Path(os.getenv("CONFIG_PATH", "config.yaml"))
     return config_path.parent / "status.json"
+
+
+def log_path() -> Path:
+    """Where the log file lives, so the web UI's Logs tab can tail it.
+
+    Mirrors better_bot.daemon.log_path() - duplicated rather than imported to
+    avoid a circular import (daemon.py already imports from this module).
+    """
+    override = os.getenv("LOG_PATH")
+    if override:
+        return Path(override)
+    config_path = Path(os.getenv("CONFIG_PATH", "config.yaml"))
+    return config_path.parent / "logs" / "daemon.log"
 
 
 def load_status() -> dict:
@@ -66,7 +82,7 @@ def record_status(name: str, status: str, session_date: date, target_time: str, 
         "session_date": session_date.isoformat(),
         "target_time": target_time,
         "detail": detail,
-        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "ran_at": datetime.now(UTC).isoformat(),
     }
     path.write_text(json.dumps(data, indent=2))
 
@@ -85,6 +101,7 @@ def already_secured(name: str, session_date: date) -> bool:
 # ------------------------------------------------------------------
 # Core booking flow
 # ------------------------------------------------------------------
+
 
 def _book_slot(
     api: BetterAPI,
@@ -108,8 +125,11 @@ def _book_slot(
     cart_item = api.cart_add(slot, occurrence)
     log.info(f"Added to cart: {cart_item.name}  £{cart_item.price_pence / 100:.2f}")
 
+    token = api._token  # noqa: SLF001
+    assert token is not None, "api.login() must be called before _book_slot()"
+
     try:
-        ref = complete_checkout(card=card, token=api._token, headless=headless)  # noqa: SLF001
+        ref = complete_checkout(card=card, token=token, headless=headless)
         log.info(f"Booking complete: {ref}")
         notify(
             subject=f"Booked: {name}",
@@ -139,7 +159,7 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
     name = target["name"]
     venue = target["venue_slug"]
     activity = target["activity_slug"]
-    target_time = target["target_time"]          # e.g. "19:30"
+    target_time = target["target_time"]  # e.g. "19:30"
     days_ahead = int(target.get("days_ahead", 7))
     release_hour = int(target.get("release_hour", 21))
 
@@ -176,6 +196,7 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
 # Cancellation watch - after an initial miss, keep checking (gently)
 # for someone else's cancellation to open the same slot back up.
 # ------------------------------------------------------------------
+
 
 def watch_and_book(
     target: dict,
@@ -270,6 +291,7 @@ def _wait_for_slot(
 # CLI
 # ------------------------------------------------------------------
 
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Better (GLL) activity booking bot")
     p.add_argument("--target", help="Run a specific target by name")
@@ -284,12 +306,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
+    path = log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            RotatingFileHandler(path, maxBytes=2_000_000, backupCount=3),
+        ],
     )
-
-    load_dotenv()
 
     targets = load_config(args.config)
 
@@ -299,34 +325,21 @@ def main() -> None:
             print(f"  [{status}] {t['name']}  ({t['venue_slug']}/{t['activity_slug']} @ {t['target_time']})")
         return
 
-    username = os.environ["BETTER_USERNAME"]
-    password = os.environ["BETTER_PASSWORD"]
-    cvv = os.getenv("CARD_CVV")
-    card_number = os.getenv("CARD_NUMBER")
-    card_expiry = os.getenv("CARD_EXPIRY")
+    settings = Settings()
+    username = settings.better_username
+    password = settings.better_password
 
     # CVV is needed for card payment; may be absent if user always has enough credit.
     # We allow it to be unset but will fail at checkout if card payment is actually required.
-    if not cvv and not card_number:
+    if not settings.card_cvv and not settings.card_number:
         log.warning("CARD_CVV not set - will only work if account credit covers the full booking cost")
 
-    if card_number and not card_expiry:
+    if settings.card_number and not settings.card_expiry:
         print("Error: CARD_NUMBER set but CARD_EXPIRY missing in .env", file=sys.stderr)
         sys.exit(1)
 
-    card = CardDetails(
-        cvv=cvv or "",
-        number=card_number,
-        expiry=card_expiry,
-        first_name=os.getenv("BILLING_FIRST_NAME"),
-        last_name=os.getenv("BILLING_LAST_NAME"),
-        address1=os.getenv("BILLING_ADDRESS1"),
-        address2=os.getenv("BILLING_ADDRESS2"),
-        city=os.getenv("BILLING_CITY"),
-        postcode=os.getenv("BILLING_POSTCODE"),
-        save_card=os.getenv("SAVE_CARD", "false").lower() in ("1", "true", "yes"),
-    )
-    log.info(f"Payment mode: {'new card' if card_number else 'saved card'}")
+    card = settings.to_card()
+    log.info(f"Payment mode: {'new card' if settings.card_number else 'saved card'}")
 
     enabled = [t for t in targets if t.get("enabled", True)]
 

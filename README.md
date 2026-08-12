@@ -10,21 +10,73 @@ Monitors slot availability, applies account credit, and completes payment automa
 > **Never commit your `.env` file to Git or push it to GitHub.** It contains passwords and card details.
 > The `.gitignore` excludes `.env` by default - keep it that way.
 
-## Quick start (Docker)
+## Self-hosting
+
+This runs entirely on your own machine (or a VPS/NAS/home server) - nothing calls out to any
+service besides Better's own site. Two long-running processes: a **daemon** that schedules and
+runs bookings, and a **web UI** for managing targets. They talk to each other only through
+`config.yaml`, `status.json`, and a shared `logs/` folder on disk - no other coupling.
+
+### Quick start (Docker, recommended)
+
+Requires Docker + Docker Compose.
 
 ```bash
 git clone https://github.com/shubhamwagh/better-booking-bot.git
 cd better-booking-bot
 cp .env.example .env          # fill in your credentials
 docker compose up -d          # runs the daemon + web UI, self-schedules from config.yaml
-docker compose logs -f        # watch logs
+docker compose logs -f        # watch logs (or use the web UI's Logs tab)
 ```
 
-The image is pre-built and published to GHCR - no build step needed.
+The image is pre-built and published to GHCR (`ghcr.io/shubhamwagh/better-booking-bot`) - no
+build step needed. `docker-compose.yml` mounts `config.yaml`, `status.json`, and `logs/` from
+the current directory, so all state survives container restarts/upgrades.
 
-Open `http://localhost:8080` for the web UI to add/enable/disable/delete targets - venue and
-activity are picked from live dropdowns (backed by the Better API), so no slugs to type by hand.
-Edits take effect within `CONFIG_POLL_S` seconds without restarting the daemon.
+**Updating** to a newer release:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+**Building the image yourself** instead of pulling the pre-built one (e.g. if you'd rather not
+trust a binary you didn't build):
+
+```bash
+docker build -t better-booking-bot .
+# then point docker-compose.yml's `image:` at `better-booking-bot` instead of the ghcr.io one
+```
+
+### Without Docker
+
+Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
+
+```bash
+git clone https://github.com/shubhamwagh/better-booking-bot.git
+cd better-booking-bot
+cp .env.example .env          # fill in your credentials
+uv sync
+uv run -m better_bot.daemon &     # scheduler - keep this running
+uv run -m better_bot.webui        # web UI on :8080 - keep this running too
+```
+
+Both need to stay running continuously, so in practice you'll want a process supervisor
+(systemd, supervisord, pm2, tmux - whatever you already use) rather than backgrounding them by
+hand as shown above. `CONFIG_PATH` and `LOG_PATH` env vars let you point either process at a
+different `config.yaml`/log location if you're not running them from the same directory.
+
+### Web UI
+
+Open `http://localhost:8080` for the web UI:
+
+- **Targets** - add/enable/disable/delete targets; venue and activity are picked from live
+  dropdowns (backed by the Better API), so no slugs to type by hand. Edits take effect within
+  `CONFIG_POLL_S` seconds without restarting the daemon.
+- **History** - last-run result per target. "mark booked" flags a target as secured if you
+  booked it yourself after the bot missed; "cancel booking" cancels a real booking (bot- or
+  manually-booked) via the same API call Better's own site uses.
+- **Logs** - tails the daemon's log file, refreshing every few seconds.
 
 ## Configuration
 

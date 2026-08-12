@@ -17,16 +17,17 @@ import logging
 import os
 import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 import yaml
 from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from starlette.status import HTTP_303_SEE_OTHER
 
 from better_bot.api import BetterAPI, BetterAPIError
+from better_bot.settings import Settings
 
 log = logging.getLogger(__name__)
 
@@ -36,8 +37,13 @@ TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 # cron day-of-week: Mon=1 .. Sat=6, Sun=0 (matches config.yaml's existing entries)
 WEEKDAYS = [
-    ("1", "Monday"), ("2", "Tuesday"), ("3", "Wednesday"), ("4", "Thursday"),
-    ("5", "Friday"), ("6", "Saturday"), ("0", "Sunday"),
+    ("1", "Monday"),
+    ("2", "Tuesday"),
+    ("3", "Wednesday"),
+    ("4", "Thursday"),
+    ("5", "Friday"),
+    ("6", "Saturday"),
+    ("0", "Sunday"),
 ]
 
 PREWARM_MINUTES = 3  # fire this many minutes before release_hour, matching existing targets
@@ -50,21 +56,39 @@ def _svg(path: str, size: int = 18) -> str:
     )
 
 
-ICON_LOGO = _svg('<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="m9 16 2 2 4-4"/>', 26)
+ICON_LOGO = _svg(
+    '<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="m9 16 2 2 4-4"/>', 26
+)
 ICON_LIST = _svg('<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>', 16)
 ICON_PLUS = _svg('<path d="M12 5v14M5 12h14"/>', 16)
 ICON_POWER = _svg('<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>', 15)
-ICON_TRASH = _svg('<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/>', 15)
-ICON_EMPTY = _svg('<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 15h.01M12 15h.01M16 15h.01"/>', 40)
+ICON_TRASH = _svg(
+    '<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/>', 15
+)
+ICON_EMPTY = _svg(
+    '<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 15h.01M12 15h.01M16 15h.01"/>',
+    40,
+)
 ICON_CHECK = _svg('<circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/>', 15)
 ICON_DASH = _svg('<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>', 15)
 ICON_X = _svg('<circle cx="12" cy="12" r="9"/><path d="m9.5 9.5 5 5m0-5-5 5"/>', 15)
 ICON_EYE = _svg('<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>', 15)
 
-STATUS_ICONS = {"booked": ICON_CHECK, "booked_manually": ICON_CHECK, "watching": ICON_EYE, "no_slot": ICON_DASH, "failed": ICON_X}
+STATUS_ICONS = {
+    "booked": ICON_CHECK,
+    "booked_manually": ICON_CHECK,
+    "watching": ICON_EYE,
+    "no_slot": ICON_DASH,
+    "failed": ICON_X,
+    "cancelled": ICON_X,
+}
 STATUS_LABELS = {
-    "booked": "booked", "booked_manually": "booked (manual)", "watching": "watching for cancellation",
-    "no_slot": "no slot found", "failed": "failed",
+    "booked": "booked",
+    "booked_manually": "booked (manual)",
+    "watching": "watching for cancellation",
+    "no_slot": "no slot found",
+    "failed": "failed",
+    "cancelled": "cancelled",
 }
 SECURED_STATUSES = {"booked", "booked_manually"}
 
@@ -153,6 +177,18 @@ def save_status(data: dict) -> None:
     _status_path().write_text(json.dumps(data, indent=2))
 
 
+def _log_path() -> Path:
+    """Mirrors better_bot.bot.log_path()/better_bot.daemon.log_path() - the daemon
+    writes here, this just reads it, so LOG_PATH must resolve the same in both."""
+    override = os.getenv("LOG_PATH")
+    if override:
+        return Path(override)
+    return _config_path().parent / "logs" / "daemon.log"
+
+
+LOG_TAIL_LINES = 500
+
+
 def build_cron(weekday: str, release_hour: int) -> str:
     minute = 60 - PREWARM_MINUTES
     hour = (release_hour - 1) % 24
@@ -162,6 +198,7 @@ def build_cron(weekday: str, release_hour: int) -> str:
 # ------------------------------------------------------------------
 # HTML rendering
 # ------------------------------------------------------------------
+
 
 def _page(body: str) -> str:
     return f"""<!doctype html>
@@ -255,11 +292,18 @@ button.danger:hover {{ background: var(--danger); color: #fff; border-color: var
 .history-status.watching {{ color: var(--accent); }}
 .history-status.no_slot {{ color: var(--muted); }}
 .history-status.failed {{ color: var(--danger); }}
+.history-status.cancelled {{ color: var(--danger); }}
+.log-box {{
+  background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+  padding: 1rem; font-family: ui-monospace, monospace; font-size: 0.8rem; line-height: 1.5;
+  max-height: 70vh; overflow: auto; white-space: pre-wrap; word-break: break-all; margin: 0;
+}}
+.log-meta {{ color: var(--muted); font-size: 0.8rem; margin-bottom: 0.75rem; }}
 </style></head>
 <body>
 <h1><span class="logo">{ICON_LOGO}</span> Better Booking Bot</h1>
 <div class="subtitle">Manage what to auto-book next week.</div>
-<div class="nav"><a href="/">Targets</a><a href="/status">History</a></div>
+<div class="nav"><a href="/">Targets</a><a href="/status">History</a><a href="/logs">Logs</a></div>
 {body}
 </body></html>"""
 
@@ -282,15 +326,15 @@ def _relative_time(iso_str: str) -> str:
 
 def _status_page(targets: list[dict], status: dict) -> str:
     if not targets:
-        return f'''<div class="card"><h2>{ICON_LIST} History</h2><p class="empty">{ICON_EMPTY}No targets configured yet.</p></div>'''
+        return f"""<div class="card"><h2>{ICON_LIST} History</h2><p class="empty">{ICON_EMPTY}No targets configured yet.</p></div>"""
     rows = []
+    today_iso = date.today().isoformat()
     for t in targets:
         name = html.escape(t["name"])
         url_name = quote(t["name"], safe="")
-        session_date = date.today() + timedelta(days=int(t.get("days_ahead", 7)))
         entry = status.get(t["name"])
         secured_for_this_session = bool(
-            entry and entry.get("status") in SECURED_STATUSES and entry.get("session_date") == session_date.isoformat()
+            entry and entry.get("status") in SECURED_STATUSES and entry.get("session_date", "") >= today_iso
         )
         if entry is None:
             result = '<span class="history-status" style="color: var(--muted)">not run yet</span>'
@@ -303,41 +347,76 @@ def _status_page(targets: list[dict], status: dict) -> str:
             title = f' title="{detail}"' if detail else ""
             result = f'<span class="history-status {key}"{title}>{icon}{label}</span>'
             when = html.escape(_relative_time(entry.get("ran_at", "")))
-        action = (
-            ""
-            if secured_for_this_session
-            else f'<form class="inline" method="post" action="/targets/{url_name}/mark-booked"><button>{ICON_CHECK}mark booked</button></form>'
-        )
-        rows.append(f"<tr><td>{name}</td><td>{result}</td><td>{when}</td><td class=\"actions\">{action}</td></tr>")
+        if secured_for_this_session:
+            action = (
+                f'<form class="inline" method="post" action="/targets/{url_name}/cancel" '
+                f"onsubmit=\"return confirm('Cancel the real booking for {name}?')\">"
+                f'<button class="danger">{ICON_X}cancel booking</button></form>'
+            )
+        else:
+            action = (
+                f'<form class="inline" method="post" action="/targets/{url_name}/mark-booked">'
+                f"<button>{ICON_CHECK}mark booked</button></form>"
+            )
+        rows.append(f'<tr><td>{name}</td><td>{result}</td><td>{when}</td><td class="actions">{action}</td></tr>')
     return f"""<div class="card">
 <h2>{ICON_LIST} History</h2>
 <div class="table-wrap">
 <table>
 <tr><th>target</th><th>last result</th><th>when</th><th></th></tr>
-{''.join(rows)}
+{"".join(rows)}
 </table>
 </div>
 </div>"""
 
 
+def _logs_page() -> str:
+    return f"""<div class="card">
+<h2>{ICON_LIST} Logs</h2>
+<div class="log-meta">Last {LOG_TAIL_LINES} lines - refreshes every 3s.</div>
+<pre class="log-box" id="log-box">Loading…</pre>
+</div>
+<script>
+(function() {{
+  var box = document.getElementById('log-box');
+  function nearBottom() {{
+    return box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  }}
+  function refresh() {{
+    var stick = nearBottom();
+    fetch('/api/logs').then(function(r) {{ return r.text(); }}).then(function(text) {{
+      box.textContent = text;
+      if (stick) box.scrollTop = box.scrollHeight;
+    }}).catch(function() {{ box.textContent = 'Could not load logs.'; }});
+  }}
+  refresh();
+  setInterval(refresh, 3000);
+}})();
+</script>"""
+
+
 def _targets_table(targets: list[dict]) -> str:
     if not targets:
-        return f'''<div class="card"><h2>{ICON_LIST} Targets</h2><p class="empty">{ICON_EMPTY}No targets configured yet - add one below.</p></div>'''
+        return f"""<div class="card"><h2>{ICON_LIST} Targets</h2><p class="empty">{ICON_EMPTY}No targets configured yet - add one below.</p></div>"""
     rows = []
     for t in targets:
         name = html.escape(t["name"])
         url_name = quote(t["name"], safe="")
         enabled = t.get("enabled", True)
         row_cls = "" if enabled else "row-disabled"
-        badge = '<span class="badge badge-on">enabled</span>' if enabled else '<span class="badge badge-off">disabled</span>'
+        badge = (
+            '<span class="badge badge-on">enabled</span>'
+            if enabled
+            else '<span class="badge badge-off">disabled</span>'
+        )
         rows.append(f"""<tr class="{row_cls}">
 <td>{name}</td>
-<td class="slug">{html.escape(t['venue_slug'])} / {html.escape(t['activity_slug'])}</td>
-<td>{html.escape(t['target_time'])}</td>
-<td>{t.get('days_ahead', 7)}d / {t.get('release_hour', 21)}:00</td>
+<td class="slug">{html.escape(t["venue_slug"])} / {html.escape(t["activity_slug"])}</td>
+<td>{html.escape(t["target_time"])}</td>
+<td>{t.get("days_ahead", 7)}d / {t.get("release_hour", 21)}:00</td>
 <td>{badge}</td>
 <td class="actions">
-<form class="inline" method="post" action="/targets/{url_name}/toggle"><button>{ICON_POWER}{'disable' if enabled else 'enable'}</button></form>
+<form class="inline" method="post" action="/targets/{url_name}/toggle"><button>{ICON_POWER}{"disable" if enabled else "enable"}</button></form>
 <form class="inline" method="post" action="/targets/{url_name}/delete" onsubmit="return confirm('Delete {name}?')"><button class="danger">{ICON_TRASH}delete</button></form>
 </td>
 </tr>""")
@@ -346,7 +425,7 @@ def _targets_table(targets: list[dict]) -> str:
 <div class="table-wrap">
 <table>
 <tr><th>name</th><th>venue / activity</th><th>time</th><th>opens</th><th>status</th><th></th></tr>
-{''.join(rows)}
+{"".join(rows)}
 </table>
 </div>
 </div>"""
@@ -526,6 +605,20 @@ def status_page() -> str:
     return _page(_status_page(targets, load_status()))
 
 
+@app.get("/logs", response_class=HTMLResponse)
+def logs_page() -> str:
+    return _page(_logs_page())
+
+
+@app.get("/api/logs", response_class=PlainTextResponse)
+def api_logs() -> str:
+    path = _log_path()
+    if not path.exists():
+        return "(no logs yet)"
+    lines = path.read_text(errors="replace").splitlines()[-LOG_TAIL_LINES:]
+    return "\n".join(lines)
+
+
 @app.post("/targets")
 def add_target(
     name: str = Form(...),
@@ -551,16 +644,18 @@ def add_target(
     if not (0 <= release_hour <= 23):
         return error("release_hour must be 0-23")
 
-    targets.append({
-        "name": name,
-        "venue_slug": venue_slug,
-        "activity_slug": activity_slug,
-        "target_time": target_time,
-        "days_ahead": days_ahead,
-        "release_hour": release_hour,
-        "cron": build_cron(weekday, release_hour),
-        "enabled": True,
-    })
+    targets.append(
+        {
+            "name": name,
+            "venue_slug": venue_slug,
+            "activity_slug": activity_slug,
+            "target_time": target_time,
+            "days_ahead": days_ahead,
+            "release_hour": release_hour,
+            "cron": build_cron(weekday, release_hour),
+            "enabled": True,
+        }
+    )
     save_config(config)
     return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
 
@@ -596,15 +691,49 @@ def mark_booked(name: str) -> RedirectResponse:
             "session_date": session_date.isoformat(),
             "target_time": target["target_time"],
             "detail": "",
-            "ran_at": datetime.now(timezone.utc).isoformat(),
+            "ran_at": datetime.now(UTC).isoformat(),
         }
         save_status(status)
+    return RedirectResponse("/status", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/targets/{name}/cancel")
+def cancel_booking(name: str) -> RedirectResponse:
+    status = load_status()
+    entry = status.get(name)
+    targets = load_config().get("targets", [])
+    target = next((t for t in targets if t["name"] == name), None)
+
+    if entry is None or target is None or entry.get("status") not in SECURED_STATUSES:
+        return RedirectResponse("/status", status_code=HTTP_303_SEE_OTHER)
+
+    try:
+        session_date = date.fromisoformat(entry["session_date"])
+        settings = Settings()
+        with BetterAPI() as api:
+            api.login(settings.better_username, settings.better_password)
+            slots = api.get_slots(target["venue_slug"], target["activity_slug"], session_date)
+            slot = next((s for s in slots if s.starts_at == target["target_time"] and s.booking_id), None)
+            if slot is None or slot.booking_id is None:
+                raise BetterAPIError(404, "No booking found for this session - may already be cancelled")
+            api.cancel_booking(slot.booking_id)
+        status[name] = {
+            **entry,
+            "status": "cancelled",
+            "detail": "cancelled from web UI",
+            "ran_at": datetime.now(UTC).isoformat(),
+        }
+        save_status(status)
+    except Exception as exc:
+        log.error("Failed to cancel booking for '%s': %s", name, exc)
+
     return RedirectResponse("/status", status_code=HTTP_303_SEE_OTHER)
 
 
 # ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------
+
 
 def main() -> None:
     import uvicorn

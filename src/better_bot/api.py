@@ -22,9 +22,10 @@ log = logging.getLogger(__name__)
 class Slot(BaseModel):
     id: str
     starts_at: str  # "HH:MM" 24-hour
-    status: str     # "BOOK" | "FULL" | ...
+    status: str  # "BOOK" | "FULL" | ...
     spaces: int
     composite_key: str
+    booking_id: int | None = None  # set when the logged-in user already holds this slot
 
 
 class OccurrenceDetails(BaseModel):
@@ -134,13 +135,16 @@ class BetterAPI:
         slots = []
         for t in resp.get("data", []):
             try:
-                slots.append(Slot(
-                    id=t["id"],
-                    starts_at=t["starts_at"]["format_24_hour"],
-                    status=t["action_to_show"]["status"],
-                    spaces=t.get("spaces_remaining", 0),
-                    composite_key=t["composite_key"],
-                ))
+                slots.append(
+                    Slot(
+                        id=t["id"],
+                        starts_at=t["starts_at"]["format_24_hour"],
+                        status=t["action_to_show"]["status"],
+                        spaces=t.get("spaces_remaining", 0),
+                        composite_key=t["composite_key"],
+                        booking_id=(t.get("booking") or {}).get("id"),
+                    )
+                )
             except Exception as exc:
                 # One malformed entry (e.g. a null status) shouldn't crash
                 # the whole poll - skip it and keep looking at the rest.
@@ -167,14 +171,16 @@ class BetterAPI:
         if self.membership_user_id is None:
             raise RuntimeError("Call fetch_membership_user_id() before cart_add()")
         payload = {
-            "items": [{
-                "id": slot.id,
-                "type": "purchasableOccurrence",
-                "purchased_for_user_id": None,
-                "pricing_option_id": occurrence.pricing_option_id,
-                "ticket_id": occurrence.ticket_id,
-                "activity_restriction_ids": [],
-            }],
+            "items": [
+                {
+                    "id": slot.id,
+                    "type": "purchasableOccurrence",
+                    "purchased_for_user_id": None,
+                    "pricing_option_id": occurrence.pricing_option_id,
+                    "ticket_id": occurrence.ticket_id,
+                    "activity_restriction_ids": [],
+                }
+            ],
             "membership_user_id": self.membership_user_id,
             "selected_user_id": None,
         }
@@ -192,14 +198,34 @@ class BetterAPI:
     def cart_remove(self, cart_item_id: int) -> None:
         if self.membership_user_id is None:
             raise RuntimeError("Call fetch_membership_user_id() before cart_remove()")
-        self._post("/activities/cart/remove", {
-            "cart_item_ids": [cart_item_id],
-            "membership_user_id": self.membership_user_id,
-            "selected_user_id": None,
-        })
+        self._post(
+            "/activities/cart/remove",
+            {
+                "cart_item_ids": [cart_item_id],
+                "membership_user_id": self.membership_user_id,
+                "selected_user_id": None,
+            },
+        )
 
     def get_cart(self) -> dict[str, Any]:
         return self._get("/activities/cart")["data"]
+
+    # ------------------------------------------------------------------
+    # Cancellation
+    # ------------------------------------------------------------------
+
+    def cancel_booking(self, booking_id: int) -> None:
+        """Cancel a confirmed booking (same call the My Account site makes)."""
+        self._patch(
+            "/v1/activities/bookings",
+            {
+                "data": {
+                    "cancellation_source": "my-account",
+                    "update_type": "cancellation",
+                    "booking_ids": [booking_id],
+                },
+            },
+        )
 
     # ------------------------------------------------------------------
     # Checkout prepare (returns Opayo session key)
@@ -220,6 +246,10 @@ class BetterAPI:
 
     def _post(self, path: str, body: Any) -> Any:
         r = self._client.post(path, json=body)
+        return self._handle(r)
+
+    def _patch(self, path: str, body: Any) -> Any:
+        r = self._client.patch(path, json=body)
         return self._handle(r)
 
     @staticmethod
