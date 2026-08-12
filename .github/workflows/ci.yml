@@ -198,19 +198,14 @@ jobs:
       # workflow silently never fires. Do the tag, the release, and the version-tagged image
       # push all inline instead of relying on that event to cascade.
 
-      - name: Tag the release commit
-        if: steps.check.outputs.exists == 'false'
-        run: |
-          git tag "v${{ steps.version.outputs.version }}"
-          git push origin "v${{ steps.version.outputs.version }}"
-
-      - name: Create GitHub Release
+      - name: Create GitHub Release (also creates the tag)
         if: steps.check.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "v${{ steps.version.outputs.version }}" \
             --title "v${{ steps.version.outputs.version }}" \
+            --target "${{ github.sha }}" \
             --generate-notes
 
       - name: Log in to GHCR
