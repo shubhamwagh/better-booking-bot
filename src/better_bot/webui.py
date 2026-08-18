@@ -27,6 +27,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from starlette.status import HTTP_303_SEE_OTHER
 
 from better_bot.api import BetterAPI, BetterAPIError
+from better_bot.bot import venue_today
 from better_bot.settings import Settings
 
 log = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ def _cached_activities(venue_slug: str) -> list[dict]:
 def _next_dates_for_weekday(cron_weekday: str, count: int = 4) -> list[date]:
     """Upcoming dates (today + weekly steps) matching a cron day-of-week (0=Sun..6=Sat)."""
     python_weekday = (int(cron_weekday) + 6) % 7  # cron dow -> Mon=0..Sun=6
-    today = date.today()
+    today = venue_today()
     first = today + timedelta(days=(python_weekday - today.weekday()) % 7)
     return [first + timedelta(weeks=i) for i in range(count)]
 
@@ -328,7 +329,7 @@ def _status_page(targets: list[dict], status: dict) -> str:
     if not targets:
         return f"""<div class="card"><h2>{ICON_LIST} History</h2><p class="empty">{ICON_EMPTY}No targets configured yet.</p></div>"""
     rows = []
-    today_iso = date.today().isoformat()
+    today_iso = venue_today().isoformat()
     for t in targets:
         name = html.escape(t["name"])
         url_name = quote(t["name"], safe="")
@@ -684,7 +685,7 @@ def mark_booked(name: str) -> RedirectResponse:
     targets = load_config().get("targets", [])
     target = next((t for t in targets if t["name"] == name), None)
     if target is not None:
-        session_date = date.today() + timedelta(days=int(target.get("days_ahead", 7)))
+        session_date = venue_today() + timedelta(days=int(target.get("days_ahead", 7)))
         status = load_status()
         status[name] = {
             "status": "booked_manually",

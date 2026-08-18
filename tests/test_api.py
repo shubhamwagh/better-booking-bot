@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from unittest.mock import patch
+
 import httpx
 import pytest
 import respx
@@ -119,13 +122,55 @@ def test_get_slots_returns_parsed_slots():
 
 
 @respx.mock
-def test_get_slots_skips_malformed_entry():
+def test_get_slots_keeps_unreleased_entry_with_null_status():
+    """A listed-but-unreleased session has a null status and a usable slot id.
+
+    Better publishes the session minutes before it opens; that entry is what
+    pre-arming keys off, so it must survive parsing rather than be discarded.
+    """
     payload = {
         "data": [
             {
                 "id": "slot-1",
                 "starts_at": {"format_24_hour": "19:30"},
                 "action_to_show": {"status": None},
+                "spaces_remaining": None,
+                "composite_key": "ck-1",
+            },
+            {
+                "id": "slot-2",
+                "starts_at": {"format_24_hour": "20:00"},
+                "action_to_show": {"status": "BOOK"},
+                "spaces_remaining": 3,
+                "composite_key": "ck-2",
+            },
+        ]
+    }
+    from datetime import date
+
+    respx.get(f"{BASE}/activities/venue/venue-a/activity/act-b/v2/times").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    api = BetterAPI()
+    slots = api.get_slots("venue-a", "act-b", date(2026, 6, 21))
+    assert len(slots) == 2
+    unreleased, open_slot = slots
+    assert unreleased.id == "slot-1"
+    assert unreleased.status is None
+    assert unreleased.spaces == 0
+    assert not unreleased.bookable
+    assert open_slot.bookable
+    api.close()
+
+
+@respx.mock
+def test_get_slots_skips_malformed_entry():
+    payload = {
+        "data": [
+            {
+                # no id at all - genuinely unparseable, unlike a null status
+                "starts_at": {"format_24_hour": "19:30"},
+                "action_to_show": {"status": "BOOK"},
                 "spaces_remaining": 5,
                 "composite_key": "ck-1",
             },
@@ -216,3 +261,84 @@ def test_handle_500_raises():
 def test_context_manager_closes():
     with BetterAPI() as api:
         assert api._client is not None
+
+
+# ------------------------------------------------------------------
+# BetterAPIError.retryable - what the release-time strike hammers through
+# ------------------------------------------------------------------
+
+
+def test_409_contention_is_retryable():
+    exc = BetterAPIError(
+        409,
+        "Sorry, a lot of people are trying to book at the moment and we were unable to process your request. "
+        "Please try again.",
+    )
+    assert exc.retryable
+
+
+def test_409_full_session_is_final():
+    assert not BetterAPIError(409, "The session being booked is already full").retryable
+
+
+def test_422_not_yet_released_is_retryable():
+    assert BetterAPIError(422, "The date should be within the valid days you are able to view.").retryable
+
+
+def test_server_errors_and_rate_limits_are_retryable():
+    assert BetterAPIError(500, "boom").retryable
+    assert BetterAPIError(503, "unavailable").retryable
+    assert BetterAPIError(429, "slow down").retryable
+
+
+def test_auth_failure_is_not_retryable():
+    assert not BetterAPIError(401, "Unauthorized").retryable
+
+
+# ------------------------------------------------------------------
+# Pre-built cart payload
+# ------------------------------------------------------------------
+
+
+def test_build_cart_payload_matches_cart_add_body():
+    api = BetterAPI()
+    api.membership_user_id = 999
+    slot = Slot(id="slot-1", starts_at="19:30", status=None, spaces=0, composite_key="ck")
+    occ = OccurrenceDetails(ticket_id="t1", pricing_option_id=8329)
+
+    payload = api.build_cart_payload(slot, occ)
+
+    assert payload["membership_user_id"] == 999
+    assert payload["items"][0]["id"] == "slot-1"
+    assert payload["items"][0]["ticket_id"] == "t1"
+    assert payload["items"][0]["pricing_option_id"] == 8329
+    api.close()
+
+
+def test_build_cart_payload_without_membership_raises():
+    api = BetterAPI()
+    slot = Slot(id="slot-1", starts_at="19:30", status=None, spaces=0, composite_key="ck")
+    with pytest.raises(RuntimeError):
+        api.build_cart_payload(slot, OccurrenceDetails(ticket_id="t1", pricing_option_id=1))
+    api.close()
+
+
+@respx.mock
+def test_server_clock_offset_reads_date_header():
+    respx.get(f"{BASE}/auth/user").mock(
+        return_value=httpx.Response(200, json={}, headers={"date": "Mon, 17 Aug 2026 20:00:00 GMT"})
+    )
+    api = BetterAPI()
+    with patch("better_bot.api.time.time", side_effect=[100.0, 100.4] * 3):
+        offset = api.server_clock_offset(samples=3)
+    # Server said 2026-08-17T20:00:00Z; local mid-request was t=100.2
+    assert offset == pytest.approx(datetime(2026, 8, 17, 20, 0, tzinfo=UTC).timestamp() - 100.2)
+    api.close()
+
+
+@respx.mock
+def test_server_clock_offset_falls_back_to_zero():
+    respx.get(f"{BASE}/auth/user").mock(return_value=httpx.Response(500, text="boom"))
+    api = BetterAPI()
+    assert api.server_clock_offset(samples=2) == 0.0
+    api.close()

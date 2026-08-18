@@ -24,7 +24,16 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from better_bot.bot import already_secured, load_status, record_status, run_target, watch_and_book
+from better_bot.bot import (
+    VENUE_TZ,
+    already_secured,
+    load_status,
+    record_status,
+    run_target,
+    venue_now,
+    venue_today,
+    watch_and_book,
+)
 from better_bot.checkout import CardDetails
 from better_bot.settings import Settings
 
@@ -209,9 +218,15 @@ def _run_and_maybe_watch(
     password: str,
     card: CardDetails,
 ) -> None:
-    run_target(target, username, password, card)
+    # A failed run is exactly when the cancellation watch matters most, so the
+    # exception must not escape before the watch below gets armed. run_target
+    # has already recorded "failed" in status.json by this point.
+    try:
+        run_target(target, username, password, card)
+    except Exception as exc:
+        log.error("Target '%s' failed: %s", target["name"], exc)
 
-    session_date = date.today() + timedelta(days=int(target.get("days_ahead", 7)))
+    session_date = venue_today() + timedelta(days=int(target.get("days_ahead", 7)))
     entry = load_status().get(target["name"], {})
     if entry.get("session_date") == session_date.isoformat() and entry.get("status") in ("no_slot", "failed"):
         _start_watch(scheduler, target, session_date, username, password, card)
@@ -277,8 +292,10 @@ def _resume_watch_if_pending(
         return
     if already_secured(target["name"], session_date):
         return
-    session_start = datetime.combine(session_date, datetime.strptime(target["target_time"], "%H:%M").time())
-    if datetime.now() >= session_start:
+    session_start = datetime.combine(
+        session_date, datetime.strptime(target["target_time"], "%H:%M").time(), tzinfo=VENUE_TZ
+    )
+    if venue_now() >= session_start:
         return
     _start_watch(scheduler, target, session_date, username, password, card)
 

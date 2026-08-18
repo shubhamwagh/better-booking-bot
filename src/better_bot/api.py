@@ -7,7 +7,11 @@ No business logic - just raw API wrappers.
 from __future__ import annotations
 
 import logging
+import statistics
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -16,16 +20,23 @@ from pydantic import BaseModel
 BASE_URL = "https://better-admin.org.uk/api"
 ORIGIN = "https://bookings.better.org.uk"
 
+# Enough pooled connections for the release-time strike burst plus headroom.
+MAX_CONNECTIONS = 8
+
 log = logging.getLogger(__name__)
 
 
 class Slot(BaseModel):
     id: str
     starts_at: str  # "HH:MM" 24-hour
-    status: str  # "BOOK" | "FULL" | ...
+    status: str | None  # "BOOK" | "FULL" | None (listed but not yet released)
     spaces: int
     composite_key: str
     booking_id: int | None = None  # set when the logged-in user already holds this slot
+
+    @property
+    def bookable(self) -> bool:
+        return self.status == "BOOK" and self.spaces > 0
 
 
 class OccurrenceDetails(BaseModel):
@@ -55,6 +66,22 @@ class BetterAPIError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
+        self.message = message
+
+    @property
+    def retryable(self) -> bool:
+        """True for load-shedding / not-yet-open responses worth hammering through.
+
+        At release time Better returns 409 with "a lot of people are trying to
+        book at the moment ... Please try again" - that is backpressure, not a
+        refusal, and the slot may still have spaces. A 409 that actually says
+        the session is full is final.
+        """
+        if self.status in (429, 425) or self.status >= 500:
+            return True
+        if self.status in (409, 422):
+            return "full" not in self.message.lower()
+        return False
 
 
 class BetterAPI:
@@ -69,7 +96,14 @@ class BetterAPI:
                     "Chrome/125.0.0.0 Safari/537.36"
                 ),
             },
-            timeout=15.0,
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            # Release time is a race: keep every connection alive and idle-ready
+            # so no strike attempt pays for a TCP + TLS handshake.
+            limits=httpx.Limits(
+                max_connections=MAX_CONNECTIONS,
+                max_keepalive_connections=MAX_CONNECTIONS,
+                keepalive_expiry=120.0,
+            ),
         )
         self._token: str | None = None
         self.membership_user_id: int | None = None
@@ -139,8 +173,8 @@ class BetterAPI:
                     Slot(
                         id=t["id"],
                         starts_at=t["starts_at"]["format_24_hour"],
-                        status=t["action_to_show"]["status"],
-                        spaces=t.get("spaces_remaining", 0),
+                        status=(t.get("action_to_show") or {}).get("status"),
+                        spaces=t.get("spaces_remaining") or 0,
                         composite_key=t["composite_key"],
                         booking_id=(t.get("booking") or {}).get("id"),
                     )
@@ -167,10 +201,15 @@ class BetterAPI:
     # Cart
     # ------------------------------------------------------------------
 
-    def cart_add(self, slot: Slot, occurrence: OccurrenceDetails) -> CartItem:
+    def build_cart_payload(self, slot: Slot, occurrence: OccurrenceDetails) -> dict[str, Any]:
+        """The exact /activities/cart/add body, built ahead of release time.
+
+        Split out from cart_add so the release-time strike has nothing left to
+        compute or look up - just a POST of an already-serialised payload.
+        """
         if self.membership_user_id is None:
-            raise RuntimeError("Call fetch_membership_user_id() before cart_add()")
-        payload = {
+            raise RuntimeError("Call fetch_membership_user_id() before build_cart_payload()")
+        return {
             "items": [
                 {
                     "id": slot.id,
@@ -184,6 +223,11 @@ class BetterAPI:
             "membership_user_id": self.membership_user_id,
             "selected_user_id": None,
         }
+
+    def cart_add(self, slot: Slot, occurrence: OccurrenceDetails) -> CartItem:
+        return self.cart_add_prepared(self.build_cart_payload(slot, occurrence))
+
+    def cart_add_prepared(self, payload: dict[str, Any]) -> CartItem:
         resp = self._post("/activities/cart/add", payload)
         items = resp["data"]["items"]
         if not items:
@@ -235,6 +279,53 @@ class BetterAPI:
         resp = self._get("/checkout/prepare")
         log.debug("Checkout prepare: provider=%s", resp.get("payment_provider"))
         return resp
+
+    # ------------------------------------------------------------------
+    # Release-time preparation
+    # ------------------------------------------------------------------
+
+    def warm_connections(self, count: int = 3) -> None:
+        """Open and keep alive `count` pooled connections.
+
+        Fired a few seconds before release so the strike burst finds warm
+        sockets instead of paying TCP + TLS setup per attempt.
+        """
+
+        def ping() -> None:
+            try:
+                self._client.get("/auth/user")
+            except Exception as exc:
+                log.debug("Connection warm-up ping failed: %s", exc)
+
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            for _ in range(count):
+                pool.submit(ping)
+        log.debug("Warmed %d connections", count)
+
+    def server_clock_offset(self, samples: int = 3) -> float:
+        """Seconds to add to local time to get server time.
+
+        Read from the `Date` response header, which is only second-granular -
+        so this is accurate to roughly ±0.5s. That is deliberately good enough:
+        the strike starts slightly *before* the computed release instant and
+        retries through it, so a small offset error costs nothing.
+        """
+        deltas = []
+        for _ in range(samples):
+            try:
+                t0 = time.time()
+                r = self._client.get("/auth/user")
+                t1 = time.time()
+                server = parsedate_to_datetime(r.headers["date"]).timestamp()
+                deltas.append(server - (t0 + t1) / 2)
+            except Exception as exc:
+                log.debug("Clock sample failed: %s", exc)
+        if not deltas:
+            log.warning("Could not read server clock - assuming no offset")
+            return 0.0
+        offset = statistics.median(deltas)
+        log.info("Server clock offset: %+.2fs", offset)
+        return offset
 
     # ------------------------------------------------------------------
     # Internal helpers
