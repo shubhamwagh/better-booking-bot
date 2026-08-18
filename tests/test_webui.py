@@ -248,6 +248,35 @@ def test_add_target_dedupes_name_collision():
     assert "Abingdon Pickleball Monday 19:30 (2)" in names
 
 
+def test_add_target_logs_lookup_failure_and_falls_back_to_slugs(caplog):
+    from better_bot.webui import load_config
+
+    with (
+        patch("better_bot.webui._cached_venues", side_effect=RuntimeError("venue api down")),
+        patch("better_bot.webui._cached_activities", side_effect=RuntimeError("activity api down")),
+        caplog.at_level("DEBUG", logger="better_bot.webui"),
+    ):
+        r = client.post(
+            "/targets",
+            data={
+                "venue_slug": "white-horse",
+                "activity_slug": "pickleball-drop-in",
+                "weekday": "1",
+                "target_time": "19:30",
+                "days_ahead": "7",
+                "release_hour": "21",
+            },
+            follow_redirects=False,
+        )
+
+    assert r.status_code == 303
+    names = [t["name"] for t in load_config()["targets"]]
+    # Falls back to the raw slugs when venue/activity lookups fail, instead of crashing.
+    assert "white-horse pickleball-drop-in Monday 19:30" in names
+    assert "venue api down" in caplog.text
+    assert "activity api down" in caplog.text
+
+
 def test_add_target_rejects_missing_venue():
     r = _post_add_target(venue_slug="")
     assert r.status_code == 200

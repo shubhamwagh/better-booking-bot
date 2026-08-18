@@ -138,15 +138,15 @@ def _auto_target_name(venue_slug: str, activity_slug: str, weekday: str, target_
         venue = next((v for v in _cached_venues() if v["slug"] == venue_slug), None)
         if venue:
             town = venue["town"]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug(f"Could not resolve venue town for '{venue_slug}': {exc}")
     activity_name = activity_slug
     try:
         activity = next((a for a in _cached_activities(venue_slug) if a["slug"] == activity_slug), None)
         if activity:
             activity_name = activity["name"]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug(f"Could not resolve activity name for '{activity_slug}': {exc}")
     weekday_label = next((label for v, label in WEEKDAYS if v == weekday), weekday)
     return f"{town} {activity_name} {weekday_label} {target_time}"
 
