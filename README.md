@@ -125,6 +125,44 @@ targets:
 Find `venue_slug` and `activity_slug` from the URL on the Better website:
 `https://bookings.better.org.uk/location/{venue_slug}/activity/{activity_slug}/...`
 
+### Phone notifications - `.env` (optional)
+
+Get a push notification on your phone the moment a target is booked, fails, or finds no
+slot - via [ntfy](https://ntfy.sh), a free push service with apps for
+[iOS](https://apps.apple.com/app/ntfy/id1625396347) and
+[Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy).
+
+**Quickest setup - the public `ntfy.sh` server, no account needed:**
+
+1. Pick a topic name nobody will guess - anyone who knows it can read your notifications,
+   since a public topic has no login. `openssl rand -hex 8` gives you something like
+   `a1b2c3d4e5f6a7b8`.
+2. In the ntfy app: add that topic name on server `ntfy.sh` (the default) and subscribe.
+3. Add to `.env`:
+   ```bash
+   NTFY_URL=https://ntfy.sh
+   NTFY_TOPIC=a1b2c3d4e5f6a7b8    # use your own random topic, not this one
+   ```
+
+No `NTFY_TOKEN` needed for a plain public topic.
+
+**Self-hosting ntfy instead** (so message content never leaves your own server): follow
+[ntfy's self-hosting docs](https://docs.ntfy.sh/install/) - Docker Compose or a container
+image is enough, no Kubernetes required. Once it's running with auth enabled
+(`auth-default-access: deny-all`), create a user and a scoped publish token:
+
+```bash
+ntfy user add <your-username>
+ntfy access <your-username> <your-topic> rw
+ntfy token add <your-username>          # -> tk_...
+```
+
+Then set `NTFY_URL` to your server, `NTFY_TOPIC` to your topic, and `NTFY_TOKEN` to the
+`tk_...` token. Log into the same user/password in the phone app to subscribe.
+
+If none of `NTFY_URL`/`NTFY_TOPIC`/`NTFY_TOKEN` are set, the bot just logs notifications
+instead of pushing anywhere - no error, no crash.
+
 ### Checkout flow (automatic)
 
 1. Adds session to cart
