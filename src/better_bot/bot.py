@@ -185,6 +185,9 @@ def _finish_checkout(
                 f"Price:    £{cart_item.price_pence / 100:.2f}\n"
                 f"Ref:      {ref}"
             ),
+            tags="tada",
+            priority="high",
+            click=ref,
         )
         record_status(name, "booked", session_date, target_time, detail=ref)
     except Exception as exc:
@@ -196,6 +199,8 @@ def _finish_checkout(
         notify(
             subject=f"Booking failed: {name}",
             body=f"Checkout failed for {name} on {session_date} {target_time}.\n\nError: {exc}",
+            tags="rotating_light",
+            priority="urgent",
         )
         raise
 
@@ -238,6 +243,8 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
                 notify(
                     subject=f"No slot: {name}",
                     body=f"No bookable slot found for {name} on {session_date} at {target_time}.",
+                    tags="warning",
+                    priority="high",
                 )
                 record_status(name, "no_slot", session_date, target_time)
                 return

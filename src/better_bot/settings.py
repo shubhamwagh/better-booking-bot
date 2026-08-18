@@ -42,3 +42,18 @@ class Settings(BaseSettings):
             postcode=self.billing_postcode,
             save_card=self.save_card,
         )
+
+
+class NtfySettings(BaseSettings):
+    """Self-hosted ntfy config for phone push on booking outcomes.
+
+    Kept separate from Settings - all fields are optional, so notify.send()
+    can always instantiate this even when BETTER_USERNAME/PASSWORD (required
+    on Settings) aren't set, e.g. in tests or a CI environment with no .env.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    ntfy_url: str | None = None
+    ntfy_topic: str | None = None
+    ntfy_token: str | None = None

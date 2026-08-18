@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from better_bot.settings import Settings
+from better_bot.settings import NtfySettings, Settings
 
 
 @pytest.fixture(autouse=True)
@@ -68,3 +68,23 @@ def test_to_card_defaults_cvv_only(monkeypatch):
     card = Settings().to_card()
     assert card.cvv == "999"
     assert card.number is None
+
+
+def test_ntfy_settings_all_optional_no_env_needed():
+    """Unlike Settings, NtfySettings must never raise just from being
+    instantiated - notify.send() calls it unconditionally on every booking
+    outcome, including in environments with no BETTER_USERNAME/PASSWORD set."""
+    s = NtfySettings()
+    assert s.ntfy_url is None
+    assert s.ntfy_topic is None
+    assert s.ntfy_token is None
+
+
+def test_ntfy_settings_reads_from_env(monkeypatch):
+    monkeypatch.setenv("NTFY_URL", "https://ntfy.shublab.com")
+    monkeypatch.setenv("NTFY_TOPIC", "booking-alerts")
+    monkeypatch.setenv("NTFY_TOKEN", "tk_abc123")
+    s = NtfySettings()
+    assert s.ntfy_url == "https://ntfy.shublab.com"
+    assert s.ntfy_topic == "booking-alerts"
+    assert s.ntfy_token == "tk_abc123"
