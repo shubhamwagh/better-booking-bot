@@ -185,6 +185,25 @@ def test_start_watch_is_idempotent(tmp_path: Path, monkeypatch):
     assert not scheduler.add_job.called
 
 
+def test_start_watch_records_why_it_is_watching(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    scheduler = MagicMock()
+    scheduler.get_job.return_value = None
+    target = {"name": "My Target", "target_time": "19:30"}
+    _start_watch(scheduler, target, date(2026, 8, 17), "user", "pass", _card(), reason="HTTP 409: a lot of people...")
+    detail = load_status()["My Target"]["detail"]
+    assert detail == "watching for cancellation - last attempt: HTTP 409: a lot of people..."
+
+
+def test_start_watch_without_reason_uses_generic_detail(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    scheduler = MagicMock()
+    scheduler.get_job.return_value = None
+    target = {"name": "My Target", "target_time": "19:30"}
+    _start_watch(scheduler, target, date(2026, 8, 17), "user", "pass", _card())
+    assert load_status()["My Target"]["detail"] == "cancellation watch active"
+
+
 # ------------------------------------------------------------------
 # _cleanup_stale_watches
 # ------------------------------------------------------------------
@@ -221,6 +240,24 @@ def test_resume_watch_if_pending_restarts_active_watch(tmp_path: Path, monkeypat
     target = {"name": "My Target", "target_time": "19:30"}
     _resume_watch_if_pending(scheduler, target, "user", "pass", _card())
     assert scheduler.add_job.called
+
+
+def test_resume_watch_if_pending_does_not_nest_the_reason_prefix(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    future_date = date.today() + timedelta(days=3)
+    record_status(
+        "My Target",
+        "watching",
+        future_date,
+        "19:30",
+        detail="watching for cancellation - last attempt: HTTP 409: too many requests",
+    )
+    scheduler = MagicMock()
+    scheduler.get_job.return_value = None
+    target = {"name": "My Target", "target_time": "19:30"}
+    _resume_watch_if_pending(scheduler, target, "user", "pass", _card())
+    detail = load_status()["My Target"]["detail"]
+    assert detail == "watching for cancellation - last attempt: HTTP 409: too many requests"
 
 
 def test_resume_watch_if_pending_skips_when_not_watching(tmp_path: Path, monkeypatch):
@@ -297,6 +334,22 @@ def test_run_and_maybe_watch_starts_watch_on_miss(tmp_path: Path, monkeypatch):
     with patch("better_bot.daemon.run_target", side_effect=fake_run_target):
         _run_and_maybe_watch(scheduler, target, "user", "pass", _card())
     assert scheduler.add_job.called
+
+
+def test_run_and_maybe_watch_carries_failure_reason_into_watch_detail(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    target = {"name": "My Target", "target_time": "19:30", "days_ahead": 7}
+    session_date = date.today() + timedelta(days=7)
+
+    def fake_run_target(t, u, p, c):
+        record_status("My Target", "failed", session_date, "19:30", detail="HTTP 409: too many requests")
+
+    scheduler = MagicMock()
+    scheduler.get_job.return_value = None
+    with patch("better_bot.daemon.run_target", side_effect=fake_run_target):
+        _run_and_maybe_watch(scheduler, target, "user", "pass", _card())
+    detail = load_status()["My Target"]["detail"]
+    assert detail == "watching for cancellation - last attempt: HTTP 409: too many requests"
 
 
 def test_run_and_maybe_watch_no_watch_when_booked(tmp_path: Path, monkeypatch):

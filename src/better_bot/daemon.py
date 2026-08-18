@@ -229,11 +229,14 @@ def _run_and_maybe_watch(
     session_date = venue_today() + timedelta(days=int(target.get("days_ahead", 7)))
     entry = load_status().get(target["name"], {})
     if entry.get("session_date") == session_date.isoformat() and entry.get("status") in ("no_slot", "failed"):
-        _start_watch(scheduler, target, session_date, username, password, card)
+        _start_watch(scheduler, target, session_date, username, password, card, reason=entry.get("detail", ""))
 
 
 def _watch_job_id(target: dict, session_date: date) -> str:
     return f"watch::{target['name']}::{session_date.isoformat()}"
+
+
+_WATCH_REASON_PREFIX = "watching for cancellation - last attempt: "
 
 
 def _start_watch(
@@ -243,6 +246,7 @@ def _start_watch(
     username: str,
     password: str,
     card: CardDetails,
+    reason: str = "",
 ) -> None:
     job_id = _watch_job_id(target, session_date)
     if scheduler.get_job(job_id):
@@ -256,7 +260,12 @@ def _start_watch(
                 pass
             log.info("Cancellation watch ended for '%s' (%s)", target["name"], session_date)
 
-    record_status(target["name"], "watching", session_date, target["target_time"], detail="cancellation watch active")
+    # Carry the original miss forward into the watch's own status entry -
+    # otherwise "watching" overwrites *why* with a generic message and the
+    # History page can no longer say whether this was a lost race, a full
+    # session, or something else.
+    detail = f"{_WATCH_REASON_PREFIX}{reason}" if reason else "cancellation watch active"
+    record_status(target["name"], "watching", session_date, target["target_time"], detail=detail)
     scheduler.add_job(
         func=_poll,
         trigger=IntervalTrigger(minutes=WATCH_INTERVAL_MINUTES),
@@ -266,11 +275,12 @@ def _start_watch(
         misfire_grace_time=120,
     )
     log.info(
-        "Started cancellation watch for '%s' -> %s %s (every %sm)",
+        "Started cancellation watch for '%s' -> %s %s (every %sm)%s",
         target["name"],
         session_date,
         target["target_time"],
         WATCH_INTERVAL_MINUTES,
+        f" - last attempt: {reason}" if reason else "",
     )
 
 
@@ -296,6 +306,10 @@ def _resume_watch_if_pending(
         session_date = date.fromisoformat(entry["session_date"])
     except (KeyError, ValueError):
         return
+    # Unwrap a previous _start_watch's own "watching for cancellation - last
+    # attempt: X" so re-arming on resume doesn't nest the prefix each time.
+    reason = entry.get("detail", "")
+    reason = reason.removeprefix(_WATCH_REASON_PREFIX)
     if already_secured(target["name"], session_date):
         return
     session_start = datetime.combine(
@@ -303,7 +317,7 @@ def _resume_watch_if_pending(
     )
     if venue_now() >= session_start:
         return
-    _start_watch(scheduler, target, session_date, username, password, card)
+    _start_watch(scheduler, target, session_date, username, password, card, reason=reason)
 
 
 def _cleanup_stale_watches(scheduler: BackgroundScheduler, enabled_names: set[str]) -> None:
