@@ -281,10 +281,16 @@ def _resume_watch_if_pending(
     password: str,
     card: CardDetails,
 ) -> None:
-    """Re-attach a watch job after a daemon restart wipes the in-memory scheduler,
-    for a watch that status.json says was still active and hasn't expired."""
+    """Re-attach a watch job after a daemon restart wipes the in-memory scheduler.
+
+    Covers both a watch already in progress ("watching") and a run that failed
+    or found nothing but never got to arm a watch, e.g. because the daemon
+    crashed or was redeployed between the failed run and the watch-arm step -
+    exactly what happened for a target that hit the release-time race before
+    this fix existed.
+    """
     entry = load_status().get(target["name"])
-    if not entry or entry.get("status") != "watching":
+    if not entry or entry.get("status") not in ("watching", "failed", "no_slot"):
         return
     try:
         session_date = date.fromisoformat(entry["session_date"])

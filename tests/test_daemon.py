@@ -7,6 +7,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from better_bot.bot import load_status, record_status
 from better_bot.checkout import CardDetails
 from better_bot.daemon import (
@@ -227,6 +229,34 @@ def test_resume_watch_if_pending_skips_when_not_watching(tmp_path: Path, monkeyp
     target = {"name": "My Target", "target_time": "19:30"}
     _resume_watch_if_pending(scheduler, target, "user", "pass", _card())
     assert not scheduler.add_job.called
+
+
+def test_resume_watch_if_pending_skips_already_booked(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    future_date = date.today() + timedelta(days=3)
+    record_status("My Target", "booked", future_date, "19:30")
+    scheduler = MagicMock()
+    target = {"name": "My Target", "target_time": "19:30"}
+    _resume_watch_if_pending(scheduler, target, "user", "pass", _card())
+    assert not scheduler.add_job.called
+
+
+@pytest.mark.parametrize("status", ["failed", "no_slot"])
+def test_resume_watch_if_pending_restarts_after_a_run_that_never_armed_a_watch(
+    tmp_path: Path, monkeypatch, status: str
+):
+    """A run that failed or missed but crashed/redeployed before reaching the
+    watch-arm step (e.g. an uncaught exception mid-run) must still get a watch
+    on the next daemon startup - status.json says "failed"/"no_slot" forever
+    otherwise, and nothing ever polls for a cancellation."""
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "config.yaml"))
+    future_date = date.today() + timedelta(days=3)
+    record_status("My Target", status, future_date, "19:30")
+    scheduler = MagicMock()
+    scheduler.get_job.return_value = None
+    target = {"name": "My Target", "target_time": "19:30"}
+    _resume_watch_if_pending(scheduler, target, "user", "pass", _card())
+    assert scheduler.add_job.called
 
 
 def test_resume_watch_if_pending_skips_when_already_secured(tmp_path: Path, monkeypatch):
