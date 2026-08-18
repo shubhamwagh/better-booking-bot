@@ -202,3 +202,53 @@ def test_delete_removes_target():
 
 def test_secured_statuses_constant():
     assert SECURED_STATUSES == {"booked", "booked_manually"}
+
+
+# ------------------------------------------------------------------
+# add target - name is derived, not typed in
+# ------------------------------------------------------------------
+
+_VENUES = [{"slug": "white-horse", "name": "White Horse Leisure Centre", "town": "Abingdon"}]
+_ACTIVITIES = [{"slug": "pickleball-drop-in", "name": "Pickleball", "category": "Racket sports"}]
+
+
+def _post_add_target(**overrides):
+    form = {
+        "venue_slug": "white-horse",
+        "activity_slug": "pickleball-drop-in",
+        "weekday": "1",
+        "target_time": "19:30",
+        "days_ahead": "7",
+        "release_hour": "21",
+    }
+    form.update(overrides)
+    with (
+        patch("better_bot.webui._cached_venues", return_value=_VENUES),
+        patch("better_bot.webui._cached_activities", return_value=_ACTIVITIES),
+    ):
+        return client.post("/targets", data=form, follow_redirects=False)
+
+
+def test_add_target_derives_name_from_venue_activity_day_time():
+    from better_bot.webui import load_config
+
+    r = _post_add_target()
+    assert r.status_code == 303
+    names = [t["name"] for t in load_config()["targets"]]
+    assert "Abingdon Pickleball Monday 19:30" in names
+
+
+def test_add_target_dedupes_name_collision():
+    from better_bot.webui import load_config
+
+    _post_add_target()
+    _post_add_target()  # same venue/activity/day/time again
+    names = [t["name"] for t in load_config()["targets"]]
+    assert names.count("Abingdon Pickleball Monday 19:30") == 1
+    assert "Abingdon Pickleball Monday 19:30 (2)" in names
+
+
+def test_add_target_rejects_missing_venue():
+    r = _post_add_target(venue_slug="")
+    assert r.status_code == 200
+    assert "Pick a venue and an activity" in r.text

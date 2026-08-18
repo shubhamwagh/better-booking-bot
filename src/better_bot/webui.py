@@ -130,6 +130,27 @@ def _next_dates_for_weekday(cron_weekday: str, count: int = 4) -> list[date]:
     return [first + timedelta(weeks=i) for i in range(count)]
 
 
+def _auto_target_name(venue_slug: str, activity_slug: str, weekday: str, target_time: str) -> str:
+    """Build the same "Town Activity Weekday HH:MM" name the existing targets use,
+    from pieces the form already collects - no free-text field for the user to fill in."""
+    town = venue_slug
+    try:
+        venue = next((v for v in _cached_venues() if v["slug"] == venue_slug), None)
+        if venue:
+            town = venue["town"]
+    except Exception:
+        pass
+    activity_name = activity_slug
+    try:
+        activity = next((a for a in _cached_activities(venue_slug) if a["slug"] == activity_slug), None)
+        if activity:
+            activity_name = activity["name"]
+    except Exception:
+        pass
+    weekday_label = next((label for v, label in WEEKDAYS if v == weekday), weekday)
+    return f"{town} {activity_name} {weekday_label} {target_time}"
+
+
 def _typical_times(venue_slug: str, activity_slug: str, cron_weekday: str) -> list[str]:
     """Distinct session start times seen on the next few occurrences of this weekday."""
     for candidate_date in _next_dates_for_weekday(cron_weekday):
@@ -447,7 +468,6 @@ def _add_form(error: str | None = None) -> str:
 {err}
 <form method="post" action="/targets">
 <div class="grid">
-<div class="full"><label>Name</label><input name="name" required></div>
 <div><label>Venue</label><select id="venue_select" name="venue_slug" required><option value="">Loading venues...</option></select></div>
 <div><label>Activity</label><select id="activity_select" name="activity_slug" required disabled><option value="">Select a venue first</option></select></div>
 <div><label>Session day</label><select id="weekday_select" name="weekday">{weekday_options}</select></div>
@@ -622,7 +642,6 @@ def api_logs() -> str:
 
 @app.post("/targets")
 def add_target(
-    name: str = Form(...),
     venue_slug: str = Form(""),
     activity_slug: str = Form(""),
     weekday: str = Form(...),
@@ -640,10 +659,16 @@ def add_target(
         return error("Pick a venue and an activity.")
     if not TIME_RE.match(target_time):
         return error("target_time must be HH:MM, 24h")
-    if any(t["name"] == name for t in targets):
-        return error(f'A target named "{name}" already exists.')
     if not (0 <= release_hour <= 23):
         return error("release_hour must be 0-23")
+
+    name = _auto_target_name(venue_slug, activity_slug, weekday, target_time)
+    existing_names = {t["name"] for t in targets}
+    if name in existing_names:
+        suffix = 2
+        while f"{name} ({suffix})" in existing_names:
+            suffix += 1
+        name = f"{name} ({suffix})"
 
     targets.append(
         {
