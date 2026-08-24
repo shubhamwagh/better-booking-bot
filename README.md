@@ -163,6 +163,25 @@ Then set `NTFY_URL` to your server, `NTFY_TOPIC` to your topic, and `NTFY_TOKEN`
 If none of `NTFY_URL`/`NTFY_TOPIC`/`NTFY_TOKEN` are set, the bot just logs notifications
 instead of pushing anywhere - no error, no crash.
 
+### Email notifications - `.env` (optional, independent of ntfy above)
+
+Get the same booked/failed/no_slot notifications as an email instead of (or alongside) a
+phone push - point at any SMTP relay. A self-hosted dev catch-all like
+[Mailpit](https://github.com/axllent/mailpit) is a good fit if you just want a web inbox to
+glance at, with no real mail server or third-party account:
+
+```bash
+SMTP_HOST=mailpit.example.com
+SMTP_PORT=1025
+MAIL_FROM=better-booking-bot@example.com
+MAIL_TO=you@example.com
+```
+
+No auth or TLS is attempted - fine for a trusted internal relay, not for sending to a real
+mailbox over the open internet. If none of `SMTP_HOST`/`MAIL_FROM`/`MAIL_TO` are set, this
+half of `notify.send()` is skipped - no error, no crash, and ntfy (if configured) still
+fires independently.
+
 ### Checkout flow (automatic)
 
 1. Adds session to cart

@@ -1,18 +1,26 @@
-"""Notification helper - pushes to a self-hosted ntfy topic, logs either way."""
+"""Notification helper - pushes to a self-hosted ntfy topic and/or emails a
+self-hosted SMTP relay (e.g. Mailpit), logs either way."""
 
 from __future__ import annotations
 
 import logging
+import smtplib
+from email.mime.text import MIMEText
 
 import httpx
 
-from better_bot.settings import NtfySettings
+from better_bot.settings import MailSettings, NtfySettings
 
 log = logging.getLogger(__name__)
 
 
 def send(subject: str, body: str, tags: str = "", priority: str = "default", click: str = "") -> None:
     log.info(f"Notification: {subject}")
+    _send_ntfy(subject, body, tags, priority, click)
+    _send_mail(subject, body)
+
+
+def _send_ntfy(subject: str, body: str, tags: str, priority: str, click: str) -> None:
     settings = NtfySettings()
     if not (settings.ntfy_url and settings.ntfy_topic and settings.ntfy_token):
         log.debug("NTFY_URL/NTFY_TOPIC/NTFY_TOKEN not set - skipping push, logged only")
@@ -38,3 +46,21 @@ def send(subject: str, body: str, tags: str = "", priority: str = "default", cli
         resp.raise_for_status()
     except Exception as exc:
         log.warning(f"ntfy push failed: {exc}")
+
+
+def _send_mail(subject: str, body: str) -> None:
+    settings = MailSettings()
+    if not (settings.smtp_host and settings.mail_from and settings.mail_to):
+        log.debug("SMTP_HOST/MAIL_FROM/MAIL_TO not set - skipping email, logged only")
+        return
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = settings.mail_from
+    msg["To"] = settings.mail_to
+
+    try:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as server:
+            server.send_message(msg)
+    except Exception as exc:
+        log.warning(f"email send failed: {exc}")
