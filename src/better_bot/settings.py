@@ -57,3 +57,19 @@ class NtfySettings(BaseSettings):
     ntfy_url: str | None = None
     ntfy_topic: str | None = None
     ntfy_token: str | None = None
+
+
+class MailSettings(BaseSettings):
+    """Self-hosted SMTP relay (e.g. Mailpit) for an email copy of booking outcomes.
+
+    Kept separate from Settings for the same reason as NtfySettings - all
+    fields are optional, so notify.send() can always instantiate this even
+    when BETTER_USERNAME/PASSWORD (required on Settings) aren't set.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    smtp_host: str | None = None
+    smtp_port: int = 1025
+    mail_from: str | None = None
+    mail_to: str | None = None

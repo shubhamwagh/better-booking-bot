@@ -1,4 +1,4 @@
-"""Tests for the ntfy notification helper."""
+"""Tests for the ntfy + email notification helpers."""
 
 from __future__ import annotations
 
@@ -81,4 +81,39 @@ def test_send_swallows_http_error_status(monkeypatch):
         resp = MagicMock()
         resp.raise_for_status.side_effect = httpx.HTTPStatusError("403", request=MagicMock(), response=MagicMock())
         post.return_value = resp
+        notify.send(subject="x", body="y")  # must not raise
+
+
+def _configure_mail(monkeypatch):
+    monkeypatch.setenv("SMTP_HOST", "mailpit.mailpit.svc.cluster.local")
+    monkeypatch.setenv("SMTP_PORT", "1025")
+    monkeypatch.setenv("MAIL_FROM", "better-booking-bot@homelab.local")
+    monkeypatch.setenv("MAIL_TO", "shubham@homelab.local")
+
+
+def test_send_skips_mail_when_unconfigured():
+    with patch("better_bot.notify.smtplib.SMTP") as smtp:
+        notify.send(subject="Booked: Test", body="details")
+    assert not smtp.called
+
+
+def test_send_emails_configured_relay(monkeypatch):
+    _configure_mail(monkeypatch)
+    with patch("better_bot.notify.smtplib.SMTP") as smtp:
+        server = smtp.return_value.__enter__.return_value
+        notify.send(subject="Booked: Test", body="details")
+
+    smtp.assert_called_once_with("mailpit.mailpit.svc.cluster.local", 1025, timeout=10)
+    assert server.send_message.called
+    msg = server.send_message.call_args[0][0]
+    assert msg["Subject"] == "Booked: Test"
+    assert msg["From"] == "better-booking-bot@homelab.local"
+    assert msg["To"] == "shubham@homelab.local"
+    assert msg.get_payload() == "details"
+
+
+def test_send_swallows_smtp_errors(monkeypatch):
+    """A booking must never fail because the email copy failed to send."""
+    _configure_mail(monkeypatch)
+    with patch("better_bot.notify.smtplib.SMTP", side_effect=OSError("connection refused")):
         notify.send(subject="x", body="y")  # must not raise
