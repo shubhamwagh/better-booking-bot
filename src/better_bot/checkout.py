@@ -150,17 +150,10 @@ def complete_checkout(
 # ------------------------------------------------------------------
 
 
-def _is_zero_balance(page: Page) -> bool:
-    """Return True if the total to pay is £0 after credit was applied."""
+def _read_total_to_pay(page: Page) -> str | None:
+    """Best-effort read of the 'Total to pay' summary line, for diagnostics."""
     try:
-        text = page.locator('button:has-text("Pay £0"), button:has-text("Pay £0.00")').first
-        if text.is_visible(timeout=2_000):
-            return True
-    except Exception:
-        pass
-    # Fallback: parse summary total from page text
-    try:
-        total = page.evaluate("""
+        return page.evaluate("""
             () => {
                 const els = [...document.querySelectorAll('*')];
                 for (const el of els) {
@@ -172,10 +165,27 @@ def _is_zero_balance(page: Page) -> bool:
                 return null;
             }
         """)
-        if total and "0.00" in total:
+    except Exception:
+        return None
+
+
+def _is_zero_balance(page: Page) -> bool:
+    """Return True if the total to pay is £0 after credit was applied."""
+    try:
+        text = page.locator('button:has-text("Pay £0"), button:has-text("Pay £0.00")').first
+        if text.is_visible(timeout=2_000):
+            log.info("Total to pay is £0 (Pay £0 button visible)")
             return True
     except Exception:
         pass
+    # Fallback: parse summary total from page text
+    total = _read_total_to_pay(page)
+    if total:
+        log.info("Total to pay after credit check: %s", total)
+        if "0.00" in total:
+            return True
+    else:
+        log.info("Could not read 'Total to pay' summary line")
     return False
 
 
@@ -190,18 +200,21 @@ def _has_saved_card(page: Page) -> bool:
 
 def _apply_full_credit(page: Page) -> None:
     """Click 'Pay full amount using credit' and wait for the page to update."""
+    total_before = _read_total_to_pay(page)
+    if total_before:
+        log.info("Total to pay before credit check: %s", total_before)
     try:
         btn = page.locator('button:has-text("Pay full amount using credit")').first
         if btn.is_visible(timeout=5_000):
             btn.click()
-            log.debug("Clicked 'Pay full amount using credit'")
+            log.info("Clicked 'Pay full amount using credit'")
             # Wait for page to reflect updated total (network idle or URL change)
             page.wait_for_load_state("networkidle", timeout=10_000)
             time.sleep(1)
             return
+        log.info("'Pay full amount using credit' button not visible - no credit available or already applied")
     except Exception as exc:
-        log.debug(f"'Pay full amount using credit' button not found or click failed: {exc}")
-    log.debug("Credit may already be applied or button not present")
+        log.warning("'Pay full amount using credit' button click failed: %s", exc)
 
 
 # ------------------------------------------------------------------
