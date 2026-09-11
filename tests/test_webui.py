@@ -281,3 +281,24 @@ def test_add_target_rejects_missing_venue():
     r = _post_add_target(venue_slug="")
     assert r.status_code == 200
     assert "Pick a venue and an activity" in r.text
+
+
+def test_times_on_date_calls_api_for_exact_date():
+    """Drop-ins don't recur on a fixed weekday, so the weekday-guessing lookup
+    (_typical_times) can come back empty. Picking an exact date instead should
+    do one direct get_slots call for that date - no guessing."""
+    api = MagicMock()
+    api.get_slots.return_value = [_make_slot("12:00", "BOOK"), _make_slot("12:00", "BOOK")]
+
+    with patch("better_bot.webui._api", api):
+        r = client.get("/api/venues/white-horse/activities/pickleball-drop-in/times-on-date?on=2026-09-20")
+
+    assert r.status_code == 200
+    assert r.json() == ["12:00"]
+    called_date = api.get_slots.call_args[0][2]
+    assert called_date == date(2026, 9, 20)
+
+
+def test_times_on_date_rejects_bad_date_format():
+    r = client.get("/api/venues/white-horse/activities/pickleball-drop-in/times-on-date?on=20-09-2026")
+    assert r.status_code == 422
