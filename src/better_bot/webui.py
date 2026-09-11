@@ -163,6 +163,22 @@ def _typical_times(venue_slug: str, activity_slug: str, cron_weekday: str) -> li
     return []
 
 
+def _times_for_date(venue_slug: str, activity_slug: str, on: date) -> list[str]:
+    """Distinct session start times on one exact date - a single direct API call.
+
+    _typical_times guesses at up to 4 future occurrences of a weekday, which
+    assumes the activity recurs weekly at a fixed time. Drop-ins and other
+    irregularly-scheduled activities don't fit that assumption and can come
+    back empty, forcing the time to be typed in by hand. Picking an exact
+    date sidesteps the guessing entirely - just call the API for that date.
+    """
+    try:
+        slots = _api.get_slots(venue_slug, activity_slug, on)
+    except BetterAPIError:
+        return []
+    return sorted({s.starts_at for s in slots})
+
+
 def _config_path() -> Path:
     return Path(os.getenv("CONFIG_PATH", "config.yaml"))
 
@@ -471,6 +487,7 @@ def _add_form(error: str | None = None) -> str:
 <div><label>Venue</label><select id="venue_select" name="venue_slug" required><option value="">Loading venues...</option></select></div>
 <div><label>Activity</label><select id="activity_select" name="activity_slug" required disabled><option value="">Select a venue first</option></select></div>
 <div><label>Session day</label><select id="weekday_select" name="weekday">{weekday_options}</select></div>
+<div><label>Exact date (optional, for drop-ins)</label><input type="date" id="date_override"></div>
 <div><label>Session time (24h)</label><select id="time_select" name="target_time" required disabled><option value="">Select venue, activity &amp; day first</option></select></div>
 <div><label>Days ahead slot opens</label><select name="days_ahead">{days_ahead_options}</select></div>
 <div><label>Release hour (local)</label><select name="release_hour">{release_hour_options}</select></div>
@@ -483,6 +500,7 @@ def _add_form(error: str | None = None) -> str:
   var venueSel = document.getElementById('venue_select');
   var activitySel = document.getElementById('activity_select');
   var weekdaySel = document.getElementById('weekday_select');
+  var dateOverride = document.getElementById('date_override');
   var timeSel = document.getElementById('time_select');
   var TIME_RE = /^([01]\\d|2[0-3]):([0-5]\\d)$/;
 
@@ -548,7 +566,10 @@ def _add_form(error: str | None = None) -> str:
     setPlaceholder(timeSel, 'Select venue, activity & day first');
     if (!venueSel.value || !activitySel.value) return;
     setPlaceholder(timeSel, 'Loading times...');
-    fetch('/api/venues/' + encodeURIComponent(venueSel.value) + '/activities/' + encodeURIComponent(activitySel.value) + '/times?weekday=' + weekdaySel.value)
+    var url = dateOverride.value
+      ? '/api/venues/' + encodeURIComponent(venueSel.value) + '/activities/' + encodeURIComponent(activitySel.value) + '/times-on-date?on=' + encodeURIComponent(dateOverride.value)
+      : '/api/venues/' + encodeURIComponent(venueSel.value) + '/activities/' + encodeURIComponent(activitySel.value) + '/times?weekday=' + weekdaySel.value;
+    fetch(url)
       .then(function(r) {{ if (!r.ok) throw new Error(); return r.json(); }})
       .then(function(times) {{
         setPlaceholder(timeSel, times.length ? 'Select a time...' : 'No upcoming slots found');
@@ -586,6 +607,7 @@ def _add_form(error: str | None = None) -> str:
   venueSel.addEventListener('change', function() {{ loadActivities(); }});
   activitySel.addEventListener('change', loadTimes);
   weekdaySel.addEventListener('change', loadTimes);
+  dateOverride.addEventListener('change', loadTimes);
   loadVenues();
 }})();
 </script>"""
@@ -612,6 +634,15 @@ def api_times(venue_slug: str, activity_slug: str, weekday: str) -> list[str]:
     if weekday not in {v for v, _ in WEEKDAYS}:
         raise HTTPException(status_code=422, detail="weekday must be one of the cron day-of-week values 0-6")
     return _typical_times(venue_slug, activity_slug, weekday)
+
+
+@app.get("/api/venues/{venue_slug}/activities/{activity_slug}/times-on-date")
+def api_times_on_date(venue_slug: str, activity_slug: str, on: str) -> list[str]:
+    try:
+        target_date = date.fromisoformat(on)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="on must be an ISO date, YYYY-MM-DD") from exc
+    return _times_for_date(venue_slug, activity_slug, target_date)
 
 
 @app.get("/", response_class=HTMLResponse)
