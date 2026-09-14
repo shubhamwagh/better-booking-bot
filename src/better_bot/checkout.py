@@ -227,7 +227,7 @@ def _apply_credit(page: Page) -> None:
     except Exception as exc:
         log.warning("'Pay full amount using credit' button click failed: %s", exc)
 
-    _apply_partial_credit(page)
+    _apply_partial_credit(page, total_hint=_parse_money(total_before))
 
 
 def _read_credit_balance(page: Page) -> float | None:
@@ -240,18 +240,32 @@ def _read_credit_balance(page: Page) -> float | None:
         return None
 
 
-def _apply_partial_credit(page: Page) -> None:
-    """Redeem whatever credit is available via the manual amount box + Submit.
+def _parse_money(text: str | None) -> float | None:
+    """Extract a £X.XX amount from a free-text money string, e.g. 'Total: £4.20'."""
+    if not text:
+        return None
+    m = re.search(r"([\d,]+\.\d{2})", text)
+    return float(m.group(1).replace(",", "")) if m else None
 
-    Used when the full-credit button isn't shown (credit balance is below the
-    booking total) - enters the full available balance as the amount to
-    redeem, since Better applies it as a partial payment and charges the
-    remainder to card, same as if a human typed it in manually.
+
+def _apply_partial_credit(page: Page, total_hint: float | None = None) -> None:
+    """Redeem available credit via the manual amount box + Submit.
+
+    Used when the full-credit button isn't shown - either because credit is
+    below the booking total, or (observed live: a credit balance exactly
+    equal to the total can also fail to show it) some other page quirk.
+    Redeems min(balance, total_hint) - capped to the total so it never asks
+    to redeem more credit than is actually owed - and leaves any remainder to
+    be charged to card as normal.
     """
     balance = _read_credit_balance(page)
     if not balance:
         log.info("No redeemable credit balance found on page - skipping partial credit")
         return
+
+    amount = min(balance, total_hint) if total_hint else balance
+    if amount != balance:
+        log.info("Capping credit redemption to total owed: £%.2f (balance is £%.2f)", amount, balance)
 
     label = page.locator('label:has-text("Enter the amount to pay in credit")').first
     try:
@@ -271,10 +285,10 @@ def _apply_partial_credit(page: Page) -> None:
 
     try:
         amount_input.click()
-        amount_input.fill(f"{balance:.2f}")
+        amount_input.fill(f"{amount:.2f}")
         expect(submit_btn).to_be_enabled(timeout=5_000)
         submit_btn.click()
-        log.info("Redeemed £%.2f partial credit", balance)
+        log.info("Redeemed £%.2f partial credit", amount)
         page.wait_for_load_state("networkidle", timeout=10_000)
         time.sleep(1)
     except Exception as exc:
