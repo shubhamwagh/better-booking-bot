@@ -5,8 +5,10 @@ Handles Opayo payment via three modes:
   - saved card:  radio already selected, inject CVV only.
   - new card:    click "Pay with a different card", fill number + expiry + CVV.
 
-Credit is auto-applied by Better's checkout page; partial credit reduces the
-total and the remainder is charged to the card as normal.
+Credit is applied against the total before card payment: the "pay full amount
+using credit" button when credit covers the whole cost, else the manual
+"enter amount to redeem" box for whatever partial balance is available - the
+remainder is then charged to the card as normal.
 
 Only this module needs a browser - everything else is pure API.
 """
@@ -14,6 +16,7 @@ Only this module needs a browser - everything else is pure API.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -104,7 +107,7 @@ def complete_checkout(
             time.sleep(2)
 
             # Step 1: apply any available credit
-            _apply_full_credit(page)
+            _apply_credit(page)
 
             # Step 2: detect payment mode from page
             if _is_zero_balance(page):
@@ -198,11 +201,19 @@ def _has_saved_card(page: Page) -> bool:
         return False
 
 
-def _apply_full_credit(page: Page) -> None:
-    """Click 'Pay full amount using credit' and wait for the page to update."""
+def _apply_credit(page: Page) -> None:
+    """Apply available account credit toward the total.
+
+    Tries 'Pay full amount using credit' first (shown when credit fully covers
+    the total). If that button isn't there - typically because credit is less
+    than the total - falls back to the manual 'Enter the amount to pay in
+    credit' box, redeeming whatever credit is available as a partial payment
+    and leaving the remainder to be charged to card as normal.
+    """
     total_before = _read_total_to_pay(page)
     if total_before:
         log.info("Total to pay before credit check: %s", total_before)
+
     try:
         btn = page.locator('button:has-text("Pay full amount using credit")').first
         if btn.is_visible(timeout=5_000):
@@ -212,9 +223,62 @@ def _apply_full_credit(page: Page) -> None:
             page.wait_for_load_state("networkidle", timeout=10_000)
             time.sleep(1)
             return
-        log.info("'Pay full amount using credit' button not visible - no credit available or already applied")
+        log.info("'Pay full amount using credit' button not visible - trying partial credit redemption")
     except Exception as exc:
         log.warning("'Pay full amount using credit' button click failed: %s", exc)
+
+    _apply_partial_credit(page)
+
+
+def _read_credit_balance(page: Page) -> float | None:
+    """Parse the account credit balance from 'You have £X.XX credit...' on the page."""
+    try:
+        text = page.evaluate("() => document.body.innerText")
+        m = re.search(r"You have\s*£\s*([\d.]+)\s*credit", text, re.IGNORECASE)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def _apply_partial_credit(page: Page) -> None:
+    """Redeem whatever credit is available via the manual amount box + Submit.
+
+    Used when the full-credit button isn't shown (credit balance is below the
+    booking total) - enters the full available balance as the amount to
+    redeem, since Better applies it as a partial payment and charges the
+    remainder to card, same as if a human typed it in manually.
+    """
+    balance = _read_credit_balance(page)
+    if not balance:
+        log.info("No redeemable credit balance found on page - skipping partial credit")
+        return
+
+    label = page.locator('label:has-text("Enter the amount to pay in credit")').first
+    try:
+        if not label.is_visible(timeout=3_000):
+            log.info("Partial credit input not present - skipping")
+            return
+    except Exception:
+        log.info("Partial credit input not present - skipping")
+        return
+
+    amount_input = page.locator(
+        "xpath=//label[contains(., 'Enter the amount to pay in credit')]/following::input[1]"
+    ).first
+    submit_btn = page.locator(
+        "xpath=//label[contains(., 'Enter the amount to pay in credit')]/following::button[1]"
+    ).first
+
+    try:
+        amount_input.click()
+        amount_input.fill(f"{balance:.2f}")
+        expect(submit_btn).to_be_enabled(timeout=5_000)
+        submit_btn.click()
+        log.info("Redeemed £%.2f partial credit", balance)
+        page.wait_for_load_state("networkidle", timeout=10_000)
+        time.sleep(1)
+    except Exception as exc:
+        log.warning("Partial credit redemption failed: %s", exc)
 
 
 # ------------------------------------------------------------------
