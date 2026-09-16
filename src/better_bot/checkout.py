@@ -10,6 +10,13 @@ using credit" button when credit covers the whole cost, else the manual
 "enter amount to redeem" box for whatever partial balance is available - the
 remainder is then charged to the card as normal.
 
+open_checkout_session()/run_checkout() split the browser launch from the
+actual payment steps, so a release-time strike can open the browser (and
+render the checkout page) minutes early, during the pre-arm window, then
+just reload once a slot is actually won - see bot.py's CheckoutWarmer.
+complete_checkout() is the cold-start convenience wrapper for callers that
+don't pre-warm.
+
 Only this module needs a browser - everything else is pure API.
 """
 
@@ -18,9 +25,10 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
-from playwright.sync_api import Frame, Page, expect, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Frame, Page, Playwright, expect, sync_playwright
 from pydantic import BaseModel
 
 BOOKINGS_BASE = "https://bookings.better.org.uk"
@@ -42,14 +50,81 @@ class CardDetails(BaseModel):
     save_card: bool = False
 
 
-def complete_checkout(
-    card: CardDetails,
-    token: str,
-    timeout_s: int = 30,
-    confirm: bool = False,
-    headless: bool = True,
-) -> str:
-    """Navigate to checkout and complete payment.
+@dataclass
+class CheckoutSession:
+    """A live, logged-in browser sitting on the checkout page.
+
+    Opening this (browser launch, TLS handshake, JS bundle download, first
+    render) is the slow, flaky part of checkout - and under release-time
+    load it's slow enough to make the saved-card detection race. Opening it
+    minutes early, during the ample pre-arm window, means the only thing
+    left to do once a slot is actually won is reload the same warm page.
+    """
+
+    playwright: Playwright
+    browser: Browser
+    context: BrowserContext
+    page: Page
+
+    def close(self) -> None:
+        try:
+            self.browser.close()
+        finally:
+            self.playwright.stop()
+
+
+def open_checkout_session(token: str, headless: bool = True) -> CheckoutSession:
+    """Launch a browser, log in via cookie, and land on the checkout page.
+
+    Safe to call well before a cart item exists - Better's checkout page
+    renders its "your basket is empty" state in the same app shell, so this
+    still warms the TLS connection, JS bundle, and render pipeline that
+    run_checkout() will reuse the moment there's something to pay for.
+    """
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(
+        headless=headless,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1920, "height": 1080},
+    )
+    # Hide navigator.webdriver to bypass Opayo bot detection
+    context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    context.add_cookies(
+        [
+            {
+                "name": "better.org.uk-authToken",
+                "value": f'"{token}"',
+                "domain": "bookings.better.org.uk",
+                "path": "/",
+                "secure": True,
+                "httpOnly": False,
+                "sameSite": "Lax",
+            }
+        ]
+    )
+    page = context.new_page()
+    _block_analytics(page)
+
+    log.info("Pre-warming checkout page…")
+    page.goto(f"{BOOKINGS_BASE}/basket/checkout", wait_until="networkidle", timeout=30_000)
+    _dismiss_cookie_banner(page)
+    log.info("Checkout session warm and ready")
+
+    return CheckoutSession(playwright=pw, browser=browser, context=context, page=page)
+
+
+def run_checkout(session: CheckoutSession, card: CardDetails, timeout_s: int = 30) -> str:
+    """Complete payment on an already-open CheckoutSession.
+
+    Reloads the checkout page first, so a session opened before the cart had
+    anything in it picks up the real item - a warm reload against an
+    already-established connection with the JS bundle already cached,
+    rather than a cold navigation from a fresh browser process.
 
     Auto-detects payment mode from the page:
       1. Applies any available account credit.
@@ -58,9 +133,9 @@ def complete_checkout(
       4. Else → new card mode (billing details + full card).
 
     Args:
+        session: An open CheckoutSession (from open_checkout_session()).
         card: Card credentials. For saved card mode only cvv is needed.
               For new card mode also number, expiry, and billing fields.
-        token: Valid Better PASETO bearer token (from BetterAPI.login).
         timeout_s: Seconds to wait for booking confirmation.
 
     Returns:
@@ -69,83 +144,81 @@ def complete_checkout(
     Raises:
         RuntimeError: If checkout does not complete within timeout_s.
     """
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=headless,
-            args=["--disable-blink-features=AutomationControlled"],
+    page = session.page
+
+    log.info("Loading checkout with the won cart item…")
+    page.goto(f"{BOOKINGS_BASE}/basket/checkout", wait_until="networkidle", timeout=30_000)
+    _dismiss_cookie_banner(page)
+    time.sleep(2)
+
+    # Step 1: apply any available credit
+    _apply_credit(page)
+
+    # Step 2: detect payment mode from page
+    if _is_zero_balance(page):
+        log.info("Credit covers full balance - no card entry needed")
+    elif _has_saved_card(page):
+        log.info("Saved card detected - selecting saved card and filling CVV")
+        if not card.cvv:
+            raise RuntimeError("CARD_CVV required for saved card checkout but not set")
+        _select_saved_card(page)
+        _fill_saved_card_cvv(page, card.cvv)
+    elif card.number and card.expiry:
+        log.info("No saved card - entering new card details")
+        _select_new_card(page)
+        _fill_billing_details(page, card)
+        _fill_opayo_iframe(page, card)
+    else:
+        # A saved-card account should never genuinely lack a saved card at
+        # checkout - a "not found" here after _has_saved_card()'s own
+        # retries means the page didn't render it in time, not that it's
+        # absent. Falling through to new-card mode would just fail anyway
+        # (no CARD_NUMBER configured) after wasting more time - fail now
+        # with a clear reason instead.
+        raise RuntimeError(
+            "Saved card not detected on checkout page (and no CARD_NUMBER/CARD_EXPIRY configured "
+            "for new-card mode) - likely a slow page render, not a genuinely missing card"
         )
-        try:
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1920, "height": 1080},
-            )
-            # Hide navigator.webdriver to bypass Opayo bot detection
-            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            context.add_cookies(
-                [
-                    {
-                        "name": "better.org.uk-authToken",
-                        "value": f'"{token}"',
-                        "domain": "bookings.better.org.uk",
-                        "path": "/",
-                        "secure": True,
-                        "httpOnly": False,
-                        "sameSite": "Lax",
-                    }
-                ]
-            )
-            page = context.new_page()
-            _block_analytics(page)
 
-            log.info("Navigating to checkout…")
-            page.goto(f"{BOOKINGS_BASE}/basket/checkout", wait_until="networkidle", timeout=30_000)
-            _dismiss_cookie_banner(page)
-            time.sleep(2)
+    # Step 3: accept T&Cs and pay
+    _accept_terms_inline(page)
 
-            # Step 1: apply any available credit
-            _apply_credit(page)
+    log.info("Clicking Pay / Continue…")
+    pay_btn = page.locator(
+        'button[aria-label="Pay now"], button:has-text("Pay now"), '
+        'button:has-text("Pay £"), button:has-text("Continue")'
+    ).first
+    expect(pay_btn).to_be_enabled(timeout=15_000)
+    pay_btn.click(timeout=10_000)
 
-            # Step 2: detect payment mode from page
-            if _is_zero_balance(page):
-                log.info("Credit covers full balance - no card entry needed")
-            elif _has_saved_card(page):
-                log.info("Saved card detected - selecting saved card and filling CVV")
-                if not card.cvv:
-                    raise RuntimeError("CARD_CVV required for saved card checkout but not set")
-                _select_saved_card(page)
-                _fill_saved_card_cvv(page, card.cvv)
-            else:
-                log.info("No saved card - entering new card details")
-                if not card.number or not card.expiry:
-                    raise RuntimeError("No saved card found. Set CARD_NUMBER and CARD_EXPIRY in .env for new card mode")
-                _select_new_card(page)
-                _fill_billing_details(page, card)
-                _fill_opayo_iframe(page, card)
+    # Accept T&Cs modal if it appears after clicking Pay (fallback)
+    _accept_terms(page)
 
-            # Step 3: accept T&Cs and pay
-            _accept_terms_inline(page)
+    log.info("Waiting for booking confirmation…")
+    ref = _wait_for_confirmation(page, timeout_s)
+    log.info("Booking confirmed: %s", ref)
+    return ref
 
-            log.info("Clicking Pay / Continue…")
-            pay_btn = page.locator(
-                'button[aria-label="Pay now"], button:has-text("Pay now"), '
-                'button:has-text("Pay £"), button:has-text("Continue")'
-            ).first
-            expect(pay_btn).to_be_enabled(timeout=15_000)
-            pay_btn.click(timeout=10_000)
 
-            # Accept T&Cs modal if it appears after clicking Pay (fallback)
-            _accept_terms(page)
+def complete_checkout(
+    card: CardDetails,
+    token: str,
+    timeout_s: int = 30,
+    confirm: bool = False,
+    headless: bool = True,
+) -> str:
+    """Open a checkout session and complete payment in one call.
 
-            log.info("Waiting for booking confirmation…")
-            ref = _wait_for_confirmation(page, timeout_s)
-            log.info("Booking confirmed: %s", ref)
-            return ref
-        finally:
-            browser.close()
+    Convenience wrapper around open_checkout_session() + run_checkout() for
+    callers that don't pre-warm (the cancellation watch, ad-hoc scripts).
+    The release-time strike path pre-warms via open_checkout_session() well
+    before the cart is won instead - see bot.py's CheckoutWarmer.
+    """
+    session = open_checkout_session(token, headless=headless)
+    try:
+        return run_checkout(session, card, timeout_s=timeout_s)
+    finally:
+        session.close()
 
 
 # ------------------------------------------------------------------
@@ -192,13 +265,25 @@ def _is_zero_balance(page: Page) -> bool:
     return False
 
 
-def _has_saved_card(page: Page) -> bool:
-    """Return True if a saved card radio button is visible on the checkout page."""
-    try:
-        radio = page.locator('input[id="saved-card"], input[value="saved_card"]').first
-        return radio.is_visible(timeout=3_000)
-    except Exception:
-        return False
+def _has_saved_card(page: Page, timeout_s: float = 10.0) -> bool:
+    """Return True if a saved card radio button is visible on the checkout page.
+
+    Polls for up to timeout_s rather than checking once - under release-time
+    load the payment section can take several seconds to render, and a false
+    "not found" here sends checkout into new-card mode, which is a
+    guaranteed failure for an account with no CARD_NUMBER configured.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            radio = page.locator('input[id="saved-card"], input[value="saved_card"]').first
+            if radio.is_visible(timeout=1_000):
+                return True
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
 
 
 def _apply_credit(page: Page) -> None:

@@ -11,6 +11,7 @@ import argparse
 import json
 import logging
 import os
+import queue
 import random
 import sys
 import threading
@@ -26,7 +27,7 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from better_bot.api import BetterAPI, BetterAPIError, CartItem, OccurrenceDetails, Slot
-from better_bot.checkout import CardDetails, complete_checkout
+from better_bot.checkout import CardDetails, CheckoutSession, complete_checkout, open_checkout_session, run_checkout
 from better_bot.notify import send as notify
 from better_bot.settings import Settings
 
@@ -128,6 +129,85 @@ def already_secured(name: str, session_date: date) -> bool:
 
 
 # ------------------------------------------------------------------
+# Checkout pre-warming - opens the checkout browser during the pre-arm
+# window (minutes of lead time) instead of after the strike wins (seconds
+# of lead time, under the heaviest possible server load). See checkout.py's
+# module docstring: the cold browser launch + render was the actual cause
+# of Monday-slot checkout failures, not the cart race itself.
+# ------------------------------------------------------------------
+
+
+class CheckoutWarmer:
+    """Opens a CheckoutSession on a background thread and holds it open
+    until the strike either wins a cart item (finish()) or the window
+    closes without one (abandon()).
+
+    All Playwright calls for a given session happen on that session's own
+    thread throughout its life, as Playwright's sync API requires - the
+    warm-up and the eventual checkout run are the same thread, just woken
+    up at a different time.
+    """
+
+    def __init__(self, token: str, headless: bool = True) -> None:
+        self._token = token
+        self._headless = headless
+        self._session: CheckoutSession | None = None
+        self._session_ready = threading.Event()
+        self._inbox: queue.Queue[tuple[CardDetails, int] | None] = queue.Queue(maxsize=1)
+        self._outbox: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+        self._thread = threading.Thread(target=self._run, daemon=True, name="checkout-warmer")
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            self._session = open_checkout_session(self._token, headless=self._headless)
+        except Exception as exc:
+            log.warning(f"Checkout pre-warm failed, will cold-start at strike time instead: {exc}")
+            self._session = None
+        finally:
+            self._session_ready.set()
+
+        item = self._inbox.get()
+        if item is None:
+            if self._session is not None:
+                self._session.close()
+            return
+
+        card, timeout_s = item
+        try:
+            if self._session is not None:
+                ref = run_checkout(self._session, card, timeout_s=timeout_s)
+            else:
+                ref = complete_checkout(card, self._token, timeout_s=timeout_s, headless=self._headless)
+            self._outbox.put(("ok", ref))
+        except Exception as exc:
+            self._outbox.put(("err", exc))
+        finally:
+            if self._session is not None:
+                self._session.close()
+
+    def finish(self, card: CardDetails, timeout_s: int = 30) -> str:
+        """Hand off the won cart item and block for the booking reference.
+
+        Falls back to a cold complete_checkout() on the same thread if the
+        pre-warm itself failed - never worse than not pre-warming at all.
+        """
+        self._session_ready.wait(timeout=20)
+        self._inbox.put((card, timeout_s))
+        kind, payload = self._outbox.get(timeout=timeout_s + 30)
+        if kind == "err":
+            raise payload
+        return payload
+
+    def abandon(self) -> None:
+        """Discard the pre-warmed session - the strike window closed without a cart."""
+        try:
+            self._inbox.put_nowait(None)
+        except queue.Full:
+            pass
+
+
+# ------------------------------------------------------------------
 # Core booking flow
 # ------------------------------------------------------------------
 
@@ -159,22 +239,27 @@ def _finish_checkout(
     session_date: date,
     card: CardDetails,
     headless: bool = True,
+    warmer: CheckoutWarmer | None = None,
 ) -> None:
     """Cart -> payment -> confirmation for an item already held in the cart.
 
     Split from _book_slot so the release-time strike, which arrives with a
-    cart item already won, can finish without repeating any lookups.
+    cart item already won, can finish without repeating any lookups. If a
+    CheckoutWarmer is given (the release-time strike path), hands off to its
+    already-open browser session instead of cold-starting one here.
     """
     name = target["name"]
     target_time = target["target_time"]
 
     log.info(f"Added to cart: {cart_item.name}  £{cart_item.price_pence / 100:.2f}")
 
-    token = api._token  # noqa: SLF001
-    assert token is not None, "api.login() must be called before _book_slot()"
-
     try:
-        ref = complete_checkout(card=card, token=token, headless=headless)
+        if warmer is not None:
+            ref = warmer.finish(card, timeout_s=30)
+        else:
+            token = api._token  # noqa: SLF001
+            assert token is not None, "api.login() must be called before _book_slot()"
+            ref = complete_checkout(card=card, token=token, headless=headless)
         log.info(f"Booking complete: {ref}")
         notify(
             subject=f"Booked: {name}",
@@ -230,10 +315,18 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
             # session is still listed unreleased, then fire the moment it opens.
             armed = _prearm(api, venue, activity, session_date, target_time, release_at)
             if armed is not None:
+                # Open the checkout browser now, during this ample pre-arm
+                # window (minutes), instead of after the strike wins
+                # (seconds, under the heaviest possible server load) - see
+                # CheckoutWarmer.
+                token = api._token  # noqa: SLF001
+                assert token is not None, "api.login() must be called before pre-warming checkout"
+                warmer = CheckoutWarmer(token, headless=headless)
                 cart_item = _strike(api, armed, release_at)
                 if cart_item is not None:
-                    _finish_checkout(api, target, cart_item, session_date, card, headless)
+                    _finish_checkout(api, target, cart_item, session_date, card, headless, warmer=warmer)
                     return
+                warmer.abandon()
                 log.warning(f"{name}: strike window closed without a cart - falling back to polling")
 
             slot = _wait_for_slot(api, venue, activity, session_date, target_time, release_hour)
