@@ -186,6 +186,18 @@ class CheckoutWarmer:
             if self._session is not None:
                 self._session.close()
 
+    # How long to wait on the background thread beyond run_checkout()'s own
+    # timeout_s before giving up. run_checkout() chains several Playwright
+    # actions (saved-card select, CVV fill, T&Cs checkbox, pay click) that
+    # each carry Playwright's own ~30s default actionability timeout on top
+    # of their explicit visibility checks - under real release-time load
+    # this legitimately adds up past a "should be quick" budget. A 30s pad
+    # (the old value) was observed to time out mid-checkout while the page
+    # was still genuinely working, producing a blank queue.Empty error and
+    # abandoning a checkout that may still complete unsupervised in the
+    # background - see the incident this constant was raised for.
+    FINISH_PAD_S = 150
+
     def finish(self, card: CardDetails, timeout_s: int = 30) -> str:
         """Hand off the won cart item and block for the booking reference.
 
@@ -194,7 +206,14 @@ class CheckoutWarmer:
         """
         self._session_ready.wait(timeout=20)
         self._inbox.put((card, timeout_s))
-        kind, payload = self._outbox.get(timeout=timeout_s + 30)
+        try:
+            kind, payload = self._outbox.get(timeout=timeout_s + self.FINISH_PAD_S)
+        except queue.Empty as exc:
+            raise RuntimeError(
+                f"checkout did not respond within {timeout_s + self.FINISH_PAD_S}s - "
+                "it may still be running unsupervised on its background thread; "
+                "check the account/bank for a possible charge before retrying"
+            ) from exc
         if kind == "err":
             raise payload
         return payload
