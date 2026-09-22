@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import queue
 import textwrap
 import threading
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from better_bot.api import BetterAPIError, CartItem, OccurrenceDetails, Slot
 from better_bot.bot import (
@@ -16,6 +19,7 @@ from better_bot.bot import (
     STRIKE_WINDOW_S,
     VENUE_TZ,
     Armed,
+    CheckoutWarmer,
     _prearm,
     _strike,
     _wait_for_slot,
@@ -584,3 +588,44 @@ def test_run_target_falls_back_to_polling_when_prearm_finds_nothing(tmp_path: Pa
     assert load_status()["My Target"]["status"] == "booked"
     api.cart_add.assert_called_once()
     api.cart_add_prepared.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# CheckoutWarmer.finish
+# ------------------------------------------------------------------
+
+
+def _bare_warmer() -> CheckoutWarmer:
+    """A CheckoutWarmer with its queues but no background thread - finish()
+    only touches _session_ready/_inbox/_outbox, so __init__ (which launches
+    a real Playwright session on a thread) doesn't need to run for these."""
+    warmer = CheckoutWarmer.__new__(CheckoutWarmer)
+    warmer._session_ready = threading.Event()
+    warmer._session_ready.set()
+    warmer._inbox = queue.Queue(maxsize=1)
+    warmer._outbox = queue.Queue(maxsize=1)
+    return warmer
+
+
+def test_checkout_warmer_finish_returns_payload_on_success():
+    warmer = _bare_warmer()
+    warmer._outbox.put(("ok", "https://booking-confirmed/1"))
+    assert warmer.finish(CardDetails(cvv="123"), timeout_s=0) == "https://booking-confirmed/1"
+
+
+def test_checkout_warmer_finish_reraises_a_real_checkout_error():
+    warmer = _bare_warmer()
+    warmer._outbox.put(("err", RuntimeError("saved card not detected")))
+    with pytest.raises(RuntimeError, match="saved card not detected"):
+        warmer.finish(CardDetails(cvv="123"), timeout_s=0)
+
+
+def test_checkout_warmer_finish_times_out_with_a_clear_message(monkeypatch):
+    """Nothing ever lands in the outbox (the background thread is still
+    working, or genuinely stuck) - finish() used to let a bare queue.Empty
+    propagate, which stringifies to '' and produced a blank "Checkout
+    failed: " log/notification with no way to tell what happened."""
+    monkeypatch.setattr(CheckoutWarmer, "FINISH_PAD_S", 0)
+    warmer = _bare_warmer()
+    with pytest.raises(RuntimeError, match="may still be running unsupervised"):
+        warmer.finish(CardDetails(cvv="123"), timeout_s=0)
