@@ -27,7 +27,14 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from better_bot.api import BetterAPI, BetterAPIError, CartItem, OccurrenceDetails, Slot
-from better_bot.checkout import CardDetails, CheckoutSession, complete_checkout, open_checkout_session, run_checkout
+from better_bot.checkout import (
+    CardDetails,
+    CheckoutSession,
+    PaymentAmbiguousError,
+    complete_checkout,
+    open_checkout_session,
+    run_checkout,
+)
 from better_bot.notify import send as notify
 from better_bot.settings import Settings
 
@@ -187,18 +194,19 @@ class CheckoutWarmer:
                 self._session.close()
 
     # How long to wait on the background thread beyond run_checkout()'s own
-    # timeout_s before giving up. run_checkout() chains several Playwright
-    # actions (saved-card select, CVV fill, T&Cs checkbox, pay click) that
-    # each carry Playwright's own ~30s default actionability timeout on top
-    # of their explicit visibility checks - under real release-time load
-    # this legitimately adds up past a "should be quick" budget. A 30s pad
-    # (the old value) was observed to time out mid-checkout while the page
-    # was still genuinely working, producing a blank queue.Empty error and
-    # abandoning a checkout that may still complete unsupervised in the
-    # background - see the incident this constant was raised for.
-    FINISH_PAD_S = 150
+    # timeout_s before giving up. run_checkout() now enforces its own hard
+    # deadline internally (every interactive step draws its timeout from a
+    # shared budget - see checkout.py's Deadline) and is guaranteed to
+    # return, one way or another, within timeout_s plus a small cleanup
+    # margin. This pad is a backstop for something worse than a slow page:
+    # a genuinely wedged browser/IPC connection that run_checkout()'s own
+    # deadline can't reach because the underlying call never returns at
+    # all. That should be rare - if it fires, _force_close_session() below
+    # is what actually stops a stuck session from silently continuing to
+    # charge a card nobody's watching any more.
+    FINISH_PAD_S = 20
 
-    def finish(self, card: CardDetails, timeout_s: int = 30) -> str:
+    def finish(self, card: CardDetails, timeout_s: int = 60) -> str:
         """Hand off the won cart item and block for the booking reference.
 
         Falls back to a cold complete_checkout() on the same thread if the
@@ -209,14 +217,45 @@ class CheckoutWarmer:
         try:
             kind, payload = self._outbox.get(timeout=timeout_s + self.FINISH_PAD_S)
         except queue.Empty as exc:
-            raise RuntimeError(
-                f"checkout did not respond within {timeout_s + self.FINISH_PAD_S}s - "
-                "it may still be running unsupervised on its background thread; "
-                "check the account/bank for a possible charge before retrying"
+            closed = self._force_close_session()
+            raise PaymentAmbiguousError(
+                f"checkout did not respond within {timeout_s + self.FINISH_PAD_S}s even though "
+                f"run_checkout() enforces its own {timeout_s}s deadline internally - the browser "
+                "session itself was wedged (network/IPC hang), not a slow page. "
+                + (
+                    "Forcibly closed the browser session to stop it (or none was open to begin "
+                    "with) - still treat this as payment-ambiguous and check the account/bank "
+                    "before retrying."
+                    if closed
+                    else "Attempting to forcibly close the browser session ALSO failed - "
+                    "treat this as a genuine payment-ambiguity risk and check the account/bank."
+                )
             ) from exc
         if kind == "err":
             raise payload
         return payload
+
+    def _force_close_session(self) -> bool:
+        """Best-effort forced termination of a session whose background
+        thread is still blocked past the full timeout+pad budget - i.e.
+        genuinely wedged, since run_checkout()'s own Deadline otherwise
+        guarantees a response well within that time. Closing the browser
+        out from under a blocked Playwright call is a supported way to
+        unstick it: the blocked call raises a connection error, which
+        _run()'s own exception handling turns into an (now-unread) "err"
+        put - but the browser process itself actually stops, which is what
+        matters here. Called from THIS thread (the caller of finish()),
+        while the background thread may still be blocked inside the
+        session - CheckoutSession.close() is written to tolerate that.
+        """
+        if self._session is None:
+            return True  # pre-warm itself never produced a session to close
+        try:
+            self._session.close()
+            return True
+        except Exception as exc:
+            log.warning(f"Forced session close after timeout also failed: {exc}")
+            return False
 
     def abandon(self) -> None:
         """Discard the pre-warmed session - the strike window closed without a cart."""
@@ -251,6 +290,25 @@ def _book_slot(
     _finish_checkout(api, target, cart_item, session_date, card, headless)
 
 
+def _check_already_booked(api: BetterAPI, target: dict, session_date: date) -> str | None:
+    """Best-effort check of whether OUR account already holds this slot.
+
+    Used only to resolve a PaymentAmbiguousError - Better's Slot.booking_id
+    is populated when the logged-in user already holds a booking for that
+    slot, so a genuine success shows up here even if our own checkout code
+    never saw the confirmation page. Returns a booking_id string if found,
+    else None (found nothing - never means "definitely didn't book", since
+    Better's own booking-finalisation could itself still be catching up).
+    """
+    try:
+        slots = api.get_slots(target["venue_slug"], target["activity_slug"], session_date)
+        match = next((s for s in slots if s.starts_at == target["target_time"]), None)
+        return str(match.booking_id) if match and match.booking_id else None
+    except Exception as exc:
+        log.warning(f"Could not verify booking status via API: {exc}")
+        return None
+
+
 def _finish_checkout(
     api: BetterAPI,
     target: dict,
@@ -274,7 +332,7 @@ def _finish_checkout(
 
     try:
         if warmer is not None:
-            ref = warmer.finish(card, timeout_s=30)
+            ref = warmer.finish(card, timeout_s=60)
         else:
             token = api._token  # noqa: SLF001
             assert token is not None, "api.login() must be called before _book_slot()"
@@ -294,6 +352,54 @@ def _finish_checkout(
             click=ref,
         )
         record_status(name, "booked", session_date, target_time, detail=ref)
+    except PaymentAmbiguousError as exc:
+        # A real incident: two separate failures here, each after Pay had
+        # already been clicked, were each treated as an ordinary miss and
+        # retried automatically - producing two real card charges for a
+        # slot that was never secured. Never do that again: check whether
+        # the booking actually went through before deciding anything, and
+        # if it's still unresolved, stop - do not let the caller (run_target
+        # / the cancellation watch) treat this as safe to retry.
+        try:
+            api.cart_remove(cart_item.cart_item_id)
+        except Exception:
+            pass
+
+        booking_id = _check_already_booked(api, target, session_date)
+        if booking_id:
+            log.info(f"{name}: booking {booking_id} found on re-check - payment DID go through")
+            notify(
+                subject=f"Booked (recovered): {name}",
+                body=(
+                    f"Booking confirmed - recovered after an ambiguous checkout result.\n\n"
+                    f"Activity: {name}\n"
+                    f"Session:  {session_date} {target_time}\n"
+                    f"Price:    £{cart_item.price_pence / 100:.2f}\n"
+                    f"Booking ID: {booking_id}"
+                ),
+                tags="tada",
+                priority="high",
+            )
+            record_status(name, "booked", session_date, target_time, detail=f"booking_id={booking_id} (recovered)")
+            return
+
+        log.error(f"{name}: PAYMENT AMBIGUOUS, not retrying automatically: {exc}")
+        notify(
+            subject=f"Payment may have been taken - {name}",
+            body=(
+                f"Checkout for {name} on {session_date} {target_time} failed AFTER the Pay button "
+                "was clicked. The card or account credit may have already been charged even though "
+                "no booking was confirmed - and this could NOT be verified against the account "
+                "afterward either.\n\n"
+                "This target will NOT be retried automatically. Please check your bank statement "
+                "and Better account/credit balance, then re-enable the target once resolved.\n\n"
+                f"Error: {exc}"
+            ),
+            tags="rotating_light,warning",
+            priority="urgent",
+        )
+        record_status(name, "payment_ambiguous", session_date, target_time, detail=str(exc))
+        raise
     except Exception as exc:
         try:
             api.cart_remove(cart_item.cart_item_id)
@@ -362,6 +468,17 @@ def run_target(target: dict, username: str, password: str, card: CardDetails, he
                 return
 
             _book_slot(api, target, slot, session_date, card, headless)
+    except PaymentAmbiguousError:
+        # _finish_checkout already recorded the correct outcome ("booked" if
+        # its own API re-check resolved it, else "payment_ambiguous") and
+        # already sent the appropriate notification - this only propagates
+        # so _run_and_maybe_watch() (daemon.py) sees a status that is NOT
+        # "failed"/"no_slot" and therefore does not arm a cancellation
+        # watch. Overwriting that status back to "failed" here would defeat
+        # the whole point: the cancellation watch is exactly what turned
+        # one ambiguous failure into two real charges in the incident this
+        # exists to prevent.
+        raise
     except Exception as exc:
         record_status(name, "failed", session_date, target_time, detail=str(exc))
         raise
@@ -548,6 +665,16 @@ def watch_and_book(
                 return False
             log.info(f"{name}: cancellation watch found an opening for {session_date} {target_time}")
             _book_slot(api, target, match, session_date, card, headless)
+    except PaymentAmbiguousError:
+        # _book_slot -> _finish_checkout already resolved this (recorded
+        # "booked" if its API re-check found the payment did go through, or
+        # "payment_ambiguous" + an urgent alert if it couldn't be verified)
+        # - either way, STOP watching. This is the exact mechanism that
+        # turned one ambiguous failure into two real card charges in the
+        # incident this exists to prevent: continuing to watch meant the
+        # next 3-minute poll tried to pay again for a booking whose first
+        # payment attempt's outcome was never actually known.
+        return True
     except Exception as exc:
         log.warning(f"{name}: cancellation watch attempt failed, still watching: {exc}")
         record_status(name, "failed", session_date, target_time, detail=str(exc))

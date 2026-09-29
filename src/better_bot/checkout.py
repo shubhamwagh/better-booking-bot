@@ -17,6 +17,18 @@ just reload once a slot is actually won - see bot.py's CheckoutWarmer.
 complete_checkout() is the cold-start convenience wrapper for callers that
 don't pre-warm.
 
+Every interactive step draws its timeout from a single shared Deadline
+instead of its own independent constant - a real incident traced to exactly
+this gap: one `.click()` with no explicit timeout silently used Playwright's
+~30s default and stalled there, and the *sum* of a dozen such independent
+timeouts had no overall ceiling. A Deadline bounds the whole attempt by
+construction. Once the Pay button has actually been clicked, any further
+failure is raised as PaymentAmbiguousError rather than a plain error - Opayo
+may already have charged the card even though our own confirmation-page
+detection failed, and callers must never treat that the same as "never
+attempted payment, safe to retry" (see bot.py's CheckoutWarmer and
+_finish_checkout for what "never treat the same" actually means).
+
 Only this module needs a browser - everything else is pure API.
 """
 
@@ -34,6 +46,59 @@ from pydantic import BaseModel
 BOOKINGS_BASE = "https://bookings.better.org.uk"
 
 log = logging.getLogger(__name__)
+
+# The floor under _wait_for_confirmation()'s own budget, applied on top of
+# whatever's left on the shared Deadline. This is the highest-stakes step -
+# money may already have moved - so it always gets a fair chance to observe
+# a genuine confirmation, even if earlier steps (which are now bounded and
+# should be fast) ran unexpectedly close to the wire.
+CONFIRMATION_MIN_S = 20.0
+
+
+class PaymentAmbiguousError(RuntimeError):
+    """Checkout failed AFTER the Pay button was clicked.
+
+    This means Opayo may already have charged the card (or the account
+    credit) even though the booking never confirmed on our side. A real
+    incident: two separate attempts each clicked Pay, each then failed on
+    "Checkout did not confirm within 30s", and each was treated as an
+    ordinary miss and retried automatically - producing two real charges
+    for a slot that was never actually secured.
+
+    Callers (bot.py's _finish_checkout / CheckoutWarmer) must never
+    auto-retry on this - check whether the booking actually went through via
+    the API first, and if it didn't, stop and require a human to check the
+    account/bank before deciding what to do next.
+    """
+
+
+class Deadline:
+    """A wall-clock budget shared across every step of one checkout attempt.
+
+    See the module docstring for the incident this exists to prevent: each
+    step drawing its timeout from this SAME instance means the total wall
+    time for one attempt is bounded by construction, not by hoping a dozen
+    independently-chosen numbers all stay small.
+    """
+
+    def __init__(self, budget_s: float) -> None:
+        self._deadline = time.monotonic() + budget_s
+
+    def remaining_s(self) -> float:
+        return self._deadline - time.monotonic()
+
+    def remaining_ms(self, cap_ms: int, floor_ms: int = 300) -> int:
+        """Milliseconds left, capped at cap_ms and floored at floor_ms.
+
+        floor_ms keeps an almost-expired deadline from handing Playwright a
+        0ms timeout - some calls treat that as "no timeout", the opposite of
+        what's intended here. A tiny floor still fails fast; it just doesn't
+        skip the actionability check Playwright would otherwise perform.
+        """
+        return max(min(int(self.remaining_s() * 1000), cap_ms), floor_ms)
+
+    def expired(self) -> bool:
+        return self.remaining_s() <= 0
 
 
 class CardDetails(BaseModel):
@@ -67,10 +132,18 @@ class CheckoutSession:
     page: Page
 
     def close(self) -> None:
+        """Idempotent and exception-safe - safe to call more than once, and
+        safe to call from a thread other than the one driving the page (see
+        CheckoutWarmer._force_close_session, which does exactly that to
+        unstick a genuinely wedged background thread)."""
         try:
             self.browser.close()
-        finally:
+        except Exception:
+            pass
+        try:
             self.playwright.stop()
+        except Exception:
+            pass
 
 
 def open_checkout_session(token: str, headless: bool = True) -> CheckoutSession:
@@ -118,7 +191,7 @@ def open_checkout_session(token: str, headless: bool = True) -> CheckoutSession:
     return CheckoutSession(playwright=pw, browser=browser, context=context, page=page)
 
 
-def run_checkout(session: CheckoutSession, card: CardDetails, timeout_s: int = 30) -> str:
+def run_checkout(session: CheckoutSession, card: CardDetails, timeout_s: int = 60) -> str:
     """Complete payment on an already-open CheckoutSession.
 
     Reloads the checkout page first, so a session opened before the cart had
@@ -136,74 +209,99 @@ def run_checkout(session: CheckoutSession, card: CardDetails, timeout_s: int = 3
         session: An open CheckoutSession (from open_checkout_session()).
         card: Card credentials. For saved card mode only cvv is needed.
               For new card mode also number, expiry, and billing fields.
-        timeout_s: Seconds to wait for booking confirmation.
+        timeout_s: Overall wall-clock budget for the whole attempt (shared
+            Deadline - see the module docstring), except the final
+            confirmation wait, which is always given at least
+            CONFIRMATION_MIN_S regardless of how much of this budget the
+            earlier steps used.
 
     Returns:
         Booking reference URL or ID.
 
     Raises:
-        RuntimeError: If checkout does not complete within timeout_s.
+        RuntimeError: A failure before the Pay button was clicked - never
+            attempted payment, safe to retry.
+        PaymentAmbiguousError: A failure after the Pay button was clicked -
+            payment may have already gone through. Never retry on this.
     """
+    deadline = Deadline(timeout_s)
     page = session.page
 
     log.info("Loading checkout with the won cart item…")
-    page.goto(f"{BOOKINGS_BASE}/basket/checkout", wait_until="networkidle", timeout=30_000)
+    page.goto(
+        f"{BOOKINGS_BASE}/basket/checkout", wait_until="networkidle", timeout=deadline.remaining_ms(cap_ms=30_000)
+    )
     _dismiss_cookie_banner(page)
     time.sleep(2)
 
     # Step 1: apply any available credit
-    _apply_credit(page)
+    _apply_credit(page, deadline)
 
     # Step 2: detect payment mode from page
-    if _is_zero_balance(page):
+    if _is_zero_balance(page, deadline):
         log.info("Credit covers full balance - no card entry needed")
-    elif _has_saved_card(page):
+    elif _has_saved_card(page, deadline):
         log.info("Saved card detected - selecting saved card and filling CVV")
         if not card.cvv:
             raise RuntimeError("CARD_CVV required for saved card checkout but not set")
-        _select_saved_card(page)
-        _fill_saved_card_cvv(page, card.cvv)
+        _select_saved_card(page, deadline)
+        _fill_saved_card_cvv(page, deadline, card.cvv)
     elif card.number and card.expiry:
         log.info("No saved card - entering new card details")
-        _select_new_card(page)
-        _fill_billing_details(page, card)
-        _fill_opayo_iframe(page, card)
+        _select_new_card(page, deadline)
+        _fill_billing_details(page, deadline, card)
+        _fill_opayo_iframe(page, deadline, card)
     else:
         # A saved-card account should never genuinely lack a saved card at
         # checkout - a "not found" here after _has_saved_card()'s own
         # retries means the page didn't render it in time, not that it's
         # absent. Falling through to new-card mode would just fail anyway
         # (no CARD_NUMBER configured) after wasting more time - fail now
-        # with a clear reason instead.
+        # with a clear reason instead. Pay has not been clicked yet - safe
+        # to retry.
         raise RuntimeError(
             "Saved card not detected on checkout page (and no CARD_NUMBER/CARD_EXPIRY configured "
             "for new-card mode) - likely a slow page render, not a genuinely missing card"
         )
 
-    # Step 3: accept T&Cs and pay
-    _accept_terms_inline(page)
+    # Step 3: accept T&Cs and pay. Everything from here on is the
+    # payment-ambiguity zone - once pay_btn.click() succeeds, ANY failure
+    # gets wrapped as PaymentAmbiguousError instead of propagating as a
+    # plain error, so callers can never mistake "already possibly charged"
+    # for "never attempted, safe to retry".
+    _accept_terms_inline(page, deadline)
 
-    log.info("Clicking Pay / Continue…")
-    pay_btn = page.locator(
-        'button[aria-label="Pay now"], button:has-text("Pay now"), '
-        'button:has-text("Pay £"), button:has-text("Continue")'
-    ).first
-    expect(pay_btn).to_be_enabled(timeout=15_000)
-    pay_btn.click(timeout=10_000)
+    pay_clicked = False
+    try:
+        log.info("Clicking Pay / Continue…")
+        pay_btn = page.locator(
+            'button[aria-label="Pay now"], button:has-text("Pay now"), '
+            'button:has-text("Pay £"), button:has-text("Continue")'
+        ).first
+        expect(pay_btn).to_be_enabled(timeout=deadline.remaining_ms(cap_ms=15_000))
+        pay_btn.click(timeout=deadline.remaining_ms(cap_ms=10_000))
+        pay_clicked = True
 
-    # Accept T&Cs modal if it appears after clicking Pay (fallback)
-    _accept_terms(page)
+        # Accept T&Cs modal if it appears after clicking Pay (fallback)
+        _accept_terms(page, deadline)
 
-    log.info("Waiting for booking confirmation…")
-    ref = _wait_for_confirmation(page, timeout_s)
-    log.info("Booking confirmed: %s", ref)
-    return ref
+        log.info("Waiting for booking confirmation…")
+        confirm_budget_s = max(deadline.remaining_s(), CONFIRMATION_MIN_S)
+        ref = _wait_for_confirmation(page, confirm_budget_s)
+        log.info("Booking confirmed: %s", ref)
+        return ref
+    except Exception as exc:
+        if pay_clicked and not isinstance(exc, PaymentAmbiguousError):
+            raise PaymentAmbiguousError(
+                f"Payment may have been submitted but checkout did not confirm it: {exc}"
+            ) from exc
+        raise
 
 
 def complete_checkout(
     card: CardDetails,
     token: str,
-    timeout_s: int = 30,
+    timeout_s: int = 60,
     confirm: bool = False,
     headless: bool = True,
 ) -> str:
@@ -245,55 +343,69 @@ def _read_total_to_pay(page: Page) -> str | None:
         return None
 
 
-def _is_zero_balance(page: Page) -> bool:
-    """Return True if the total to pay is £0 after credit was applied."""
-    try:
-        text = page.locator('button:has-text("Pay £0"), button:has-text("Pay £0.00")').first
-        if text.is_visible(timeout=2_000):
-            log.info("Total to pay is £0 (Pay £0 button visible)")
-            return True
-    except Exception:
-        pass
-    # Fallback: parse summary total from page text
-    total = _read_total_to_pay(page)
-    if total:
-        log.info("Total to pay after credit check: %s", total)
-        if "0.00" in total:
-            return True
-    else:
-        log.info("Could not read 'Total to pay' summary line")
-    return False
+def _is_zero_balance(page: Page, deadline: Deadline, settle_s: float = 5.0) -> bool:
+    """Return True if the total to pay is £0 after credit was applied.
 
-
-def _has_saved_card(page: Page, timeout_s: float = 10.0) -> bool:
-    """Return True if a saved card radio button is visible on the checkout page.
-
-    Polls for up to timeout_s rather than checking once - under release-time
-    load the payment section can take several seconds to render, and a false
-    "not found" here sends checkout into new-card mode, which is a
-    guaranteed failure for an account with no CARD_NUMBER configured.
+    Polls for up to settle_s (bounded by the shared deadline) rather than
+    checking once - a real incident traced a card being charged on top of
+    already-applied credit to exactly this gap: the page hadn't re-rendered
+    the new £0.00 total yet, this returned a false "can't tell, not zero" on
+    the very first check, and checkout fell through to ALSO filling in and
+    charging the saved card, which should never have been needed.
     """
-    deadline = time.time() + timeout_s
+    settle_deadline = time.time() + settle_s
     while True:
         try:
-            radio = page.locator('input[id="saved-card"], input[value="saved_card"]').first
-            if radio.is_visible(timeout=1_000):
+            text = page.locator('button:has-text("Pay £0"), button:has-text("Pay £0.00")').first
+            if text.is_visible(timeout=deadline.remaining_ms(cap_ms=1_000)):
+                log.info("Total to pay is £0 (Pay £0 button visible)")
                 return True
         except Exception:
             pass
-        if time.time() >= deadline:
+        # Fallback: parse summary total from page text
+        total = _read_total_to_pay(page)
+        if total:
+            if "0.00" in total:
+                log.info("Total to pay after credit check: %s", total)
+                return True
+            log.info("Total to pay after credit check: %s (not zero)", total)
+            return False
+        if time.time() >= settle_deadline or deadline.expired():
+            log.info("Could not read 'Total to pay' summary line after %.0fs - assuming non-zero", settle_s)
             return False
         time.sleep(0.5)
 
 
-def _apply_credit(page: Page) -> None:
+def _has_saved_card(page: Page, deadline: Deadline) -> bool:
+    """Return True if a saved card radio button is visible on the checkout page.
+
+    Polls against the shared deadline rather than checking once - under
+    release-time load the payment section can take several seconds to
+    render, and a false "not found" here sends checkout into new-card mode,
+    which is a guaranteed failure for an account with no CARD_NUMBER
+    configured.
+    """
+    while True:
+        try:
+            radio = page.locator('input[id="saved-card"], input[value="saved_card"]').first
+            if radio.is_visible(timeout=deadline.remaining_ms(cap_ms=1_000)):
+                return True
+        except Exception:
+            pass
+        if deadline.expired():
+            return False
+        time.sleep(0.5)
+
+
+def _apply_credit(page: Page, deadline: Deadline) -> None:
     """Apply available account credit toward the total.
 
     Tries 'Pay full amount using credit' first (shown when credit fully covers
     the total). If that button isn't there - typically because credit is less
-    than the total - falls back to the manual 'Enter the amount to pay in
-    credit' box, redeeming whatever credit is available as a partial payment
-    and leaving the remainder to be charged to card as normal.
+    than the total, but observed live to also fail to show even when credit
+    exactly equals the total - falls back to the manual 'Enter the amount to
+    pay in credit' box, redeeming whatever credit is available as a partial
+    payment and leaving the remainder to be charged to card as normal.
     """
     total_before = _read_total_to_pay(page)
     if total_before:
@@ -301,18 +413,18 @@ def _apply_credit(page: Page) -> None:
 
     try:
         btn = page.locator('button:has-text("Pay full amount using credit")').first
-        if btn.is_visible(timeout=5_000):
-            btn.click()
+        if btn.is_visible(timeout=deadline.remaining_ms(cap_ms=5_000)):
+            btn.click(timeout=deadline.remaining_ms(cap_ms=5_000))
             log.info("Clicked 'Pay full amount using credit'")
             # Wait for page to reflect updated total (network idle or URL change)
-            page.wait_for_load_state("networkidle", timeout=10_000)
+            page.wait_for_load_state("networkidle", timeout=deadline.remaining_ms(cap_ms=10_000))
             time.sleep(1)
             return
         log.info("'Pay full amount using credit' button not visible - trying partial credit redemption")
     except Exception as exc:
         log.warning("'Pay full amount using credit' button click failed: %s", exc)
 
-    _apply_partial_credit(page, total_hint=_parse_money(total_before))
+    _apply_partial_credit(page, deadline, total_hint=_parse_money(total_before))
 
 
 def _read_credit_balance(page: Page) -> float | None:
@@ -333,7 +445,7 @@ def _parse_money(text: str | None) -> float | None:
     return float(m.group(1).replace(",", "")) if m else None
 
 
-def _apply_partial_credit(page: Page, total_hint: float | None = None) -> None:
+def _apply_partial_credit(page: Page, deadline: Deadline, total_hint: float | None = None) -> None:
     """Redeem available credit via the manual amount box + Submit.
 
     Used when the full-credit button isn't shown - either because credit is
@@ -342,6 +454,11 @@ def _apply_partial_credit(page: Page, total_hint: float | None = None) -> None:
     Redeems min(balance, total_hint) - capped to the total so it never asks
     to redeem more credit than is actually owed - and leaves any remainder to
     be charged to card as normal.
+
+    A real incident traced to exactly this function: the Submit button click
+    below had no explicit timeout, silently used Playwright's ~30s default,
+    and hung there - burning half of the whole attempt's budget on its own.
+    Every action here now draws its timeout from the shared deadline instead.
     """
     balance = _read_credit_balance(page)
     if not balance:
@@ -354,7 +471,7 @@ def _apply_partial_credit(page: Page, total_hint: float | None = None) -> None:
 
     label = page.locator('label:has-text("Enter the amount to pay in credit")').first
     try:
-        if not label.is_visible(timeout=3_000):
+        if not label.is_visible(timeout=deadline.remaining_ms(cap_ms=3_000)):
             log.info("Partial credit input not present - skipping")
             return
     except Exception:
@@ -369,12 +486,12 @@ def _apply_partial_credit(page: Page, total_hint: float | None = None) -> None:
     ).first
 
     try:
-        amount_input.click()
-        amount_input.fill(f"{amount:.2f}")
-        expect(submit_btn).to_be_enabled(timeout=5_000)
-        submit_btn.click()
+        amount_input.click(timeout=deadline.remaining_ms(cap_ms=5_000))
+        amount_input.fill(f"{amount:.2f}", timeout=deadline.remaining_ms(cap_ms=5_000))
+        expect(submit_btn).to_be_enabled(timeout=deadline.remaining_ms(cap_ms=5_000))
+        submit_btn.click(timeout=deadline.remaining_ms(cap_ms=5_000))
         log.info("Redeemed £%.2f partial credit", amount)
-        page.wait_for_load_state("networkidle", timeout=10_000)
+        page.wait_for_load_state("networkidle", timeout=deadline.remaining_ms(cap_ms=10_000))
         time.sleep(1)
     except Exception as exc:
         log.warning("Partial credit redemption failed: %s", exc)
@@ -385,8 +502,15 @@ def _apply_partial_credit(page: Page, total_hint: float | None = None) -> None:
 # ------------------------------------------------------------------
 
 
-def _select_saved_card(page: Page) -> None:
-    """Click the saved card radio button."""
+def _select_saved_card(page: Page, deadline: Deadline) -> None:
+    """Click the saved card radio button.
+
+    A real incident traced part of a multi-minute stall to this function:
+    three candidate selectors, each clicked with no explicit timeout (so
+    each could silently burn Playwright's ~30s default) - worst case,
+    three unbounded clicks in a row. Every click here is now capped against
+    the shared deadline instead.
+    """
     for selector in [
         'input[type="radio"]:not([value*="different"])',
         'label:has-text("Pay with saved card")',
@@ -394,8 +518,8 @@ def _select_saved_card(page: Page) -> None:
     ]:
         try:
             el = page.locator(selector).first
-            if el.is_visible(timeout=3_000):
-                el.click()
+            if el.is_visible(timeout=deadline.remaining_ms(cap_ms=3_000)):
+                el.click(timeout=deadline.remaining_ms(cap_ms=3_000))
                 time.sleep(1)
                 log.debug(f"Selected saved card via {selector}")
                 return
@@ -404,7 +528,7 @@ def _select_saved_card(page: Page) -> None:
     log.debug("Saved card radio not found - assuming already selected")
 
 
-def _fill_saved_card_cvv(page: Page, cvv: str) -> None:
+def _fill_saved_card_cvv(page: Page, deadline: Deadline, cvv: str) -> None:
     """Fill CVV into the plain textbox shown for saved card mode."""
     for selector in [
         'input[placeholder="CVV"]',
@@ -416,9 +540,9 @@ def _fill_saved_card_cvv(page: Page, cvv: str) -> None:
     ]:
         try:
             loc = page.locator(selector).first
-            if loc.is_visible(timeout=3_000):
-                loc.click()
-                loc.type(cvv, delay=80)
+            if loc.is_visible(timeout=deadline.remaining_ms(cap_ms=3_000)):
+                loc.click(timeout=deadline.remaining_ms(cap_ms=3_000))
+                loc.type(cvv, delay=80, timeout=deadline.remaining_ms(cap_ms=3_000))
                 log.debug("CVV filled via %s", selector)
                 return
         except Exception:
@@ -426,7 +550,7 @@ def _fill_saved_card_cvv(page: Page, cvv: str) -> None:
     raise RuntimeError("Could not locate CVV textbox in saved card mode")
 
 
-def _fill_billing_details(page: Page, card: CardDetails) -> None:
+def _fill_billing_details(page: Page, deadline: Deadline, card: CardDetails) -> None:
     """Fill First name, Last name, Address, Town/city, Postcode for new card mode."""
     fields = [
         (card.first_name, ['input[id="billingFirstName"]', 'input[name="billingFirstName"]']),
@@ -442,16 +566,16 @@ def _fill_billing_details(page: Page, card: CardDetails) -> None:
         for selector in selectors:
             try:
                 loc = page.locator(selector).first
-                if loc.is_visible(timeout=2_000):
-                    loc.click()
-                    loc.fill(value)
+                if loc.is_visible(timeout=deadline.remaining_ms(cap_ms=2_000)):
+                    loc.click(timeout=deadline.remaining_ms(cap_ms=2_000))
+                    loc.fill(value, timeout=deadline.remaining_ms(cap_ms=2_000))
                     log.debug(f"Billing field filled via {selector}")
                     break
             except Exception:
                 continue
 
 
-def _select_new_card(page: Page) -> None:
+def _select_new_card(page: Page, deadline: Deadline) -> None:
     """Click the 'Pay with a different card' radio/button.
 
     If no such radio exists (new user with no saved card), the card form is
@@ -465,7 +589,7 @@ def _select_new_card(page: Page) -> None:
         '[data-testid*="new-card"]',
     ]:
         try:
-            page.click(selector, timeout=5_000)
+            page.click(selector, timeout=deadline.remaining_ms(cap_ms=5_000))
             time.sleep(1)
             log.debug(f"Selected new card via {selector}")
             return
@@ -474,7 +598,7 @@ def _select_new_card(page: Page) -> None:
     log.debug("'Pay with a different card' radio not found - assuming card form already visible")
 
 
-def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
+def _fill_opayo_iframe(page: Page, deadline: Deadline, card: CardDetails) -> None:
     """Locate the Opayo iframe and fill the required fields."""
     # Wait for Opayo iframe src to be populated in the DOM, then use
     # frame_locator (finds by element selector, handles frame load timing).
@@ -482,7 +606,7 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
     try:
         page.wait_for_function(
             "() => { const f = document.querySelector('iframe'); return f && f.src && f.src !== 'about:blank'; }",
-            timeout=30_000,
+            timeout=deadline.remaining_ms(cap_ms=30_000),
         )
         log.debug("Iframe src populated")
     except Exception as exc:
@@ -503,6 +627,7 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
     if cardholder_name:
         _type_in_frame(
             opayo,
+            deadline,
             cardholder_name,
             [
                 'input[name="cardholder-name"]',
@@ -517,6 +642,7 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
     if card.number:
         _type_in_frame(
             opayo,
+            deadline,
             card.number,
             [
                 'input[name="card-number"]',
@@ -529,6 +655,7 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
     if card.expiry:
         _type_in_frame(
             opayo,
+            deadline,
             card.expiry,
             [
                 'input[name="expiry-date"]',
@@ -540,6 +667,7 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
 
     _type_in_frame(
         opayo,
+        deadline,
         card.cvv,
         [
             'input[name="security-code"]',
@@ -553,8 +681,8 @@ def _fill_opayo_iframe(page: Page, card: CardDetails) -> None:
     if card.save_card:
         try:
             cb = page.locator('input[name="saveCard"]').first
-            if cb.is_visible(timeout=3_000) and not cb.is_checked():
-                cb.check()
+            if cb.is_visible(timeout=deadline.remaining_ms(cap_ms=3_000)) and not cb.is_checked():
+                cb.check(timeout=deadline.remaining_ms(cap_ms=3_000))
                 log.debug("'Save card' checkbox checked")
         except Exception:
             pass
@@ -568,14 +696,14 @@ def _find_opayo_frame(page: Page) -> Frame | None:
     return None
 
 
-def _type_in_frame(frame_loc: Any, value: str, selectors: list[str], label: str) -> None:
+def _type_in_frame(frame_loc: Any, deadline: Deadline, value: str, selectors: list[str], label: str) -> None:
     """Type value into first matching selector inside a frame_locator."""
     for selector in selectors:
         try:
             loc = frame_loc.locator(selector).first
-            loc.wait_for(state="visible", timeout=30_000)
-            loc.click()
-            loc.type(value, delay=80)
+            loc.wait_for(state="visible", timeout=deadline.remaining_ms(cap_ms=30_000))
+            loc.click(timeout=deadline.remaining_ms(cap_ms=5_000))
+            loc.type(value, delay=80, timeout=deadline.remaining_ms(cap_ms=5_000))
             log.debug("%s typed in frame via %s", label, selector)
             return
         except Exception:
@@ -583,11 +711,11 @@ def _type_in_frame(frame_loc: Any, value: str, selectors: list[str], label: str)
     raise RuntimeError(f"Could not locate {label} field in Opayo iframe")
 
 
-def _fill_field(frame: Frame, value: str, selectors: list[str], label: str) -> None:
+def _fill_field(frame: Frame, deadline: Deadline, value: str, selectors: list[str], label: str) -> None:
     for selector in selectors:
         try:
-            frame.wait_for_selector(selector, timeout=5_000)
-            frame.fill(selector, value)
+            frame.wait_for_selector(selector, timeout=deadline.remaining_ms(cap_ms=5_000))
+            frame.fill(selector, value, timeout=deadline.remaining_ms(cap_ms=5_000))
             log.debug("%s filled via selector %s", label, selector)
             return
         except Exception:
@@ -595,13 +723,13 @@ def _fill_field(frame: Frame, value: str, selectors: list[str], label: str) -> N
     raise RuntimeError(f"Could not locate {label} field in Opayo iframe")
 
 
-def _type_field(frame: Frame, value: str, selectors: list[str], label: str) -> None:
+def _type_field(frame: Frame, deadline: Deadline, value: str, selectors: list[str], label: str) -> None:
     """Like _fill_field but uses type() to simulate real keypresses (needed for CVV)."""
     for selector in selectors:
         try:
-            frame.wait_for_selector(selector, timeout=5_000)
-            frame.click(selector)
-            frame.type(selector, value, delay=80)
+            frame.wait_for_selector(selector, timeout=deadline.remaining_ms(cap_ms=5_000))
+            frame.click(selector, timeout=deadline.remaining_ms(cap_ms=5_000))
+            frame.type(selector, value, delay=80, timeout=deadline.remaining_ms(cap_ms=5_000))
             log.debug("%s typed via selector %s", label, selector)
             return
         except Exception:
@@ -614,7 +742,7 @@ def _type_field(frame: Frame, value: str, selectors: list[str], label: str) -> N
 # ------------------------------------------------------------------
 
 
-def _wait_for_confirmation(page: Page, timeout_s: int) -> str:
+def _wait_for_confirmation(page: Page, timeout_s: float) -> str:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if "confirmation" in page.url or "booking-confirmed" in page.url:
@@ -637,7 +765,7 @@ def _wait_for_confirmation(page: Page, timeout_s: int) -> str:
         log.warning("Timeout screenshot saved to /tmp/better-bot-timeout.png")
     except Exception:
         pass
-    raise RuntimeError(f"Checkout did not confirm within {timeout_s}s")
+    raise RuntimeError(f"Checkout did not confirm within {timeout_s:.0f}s")
 
 
 def _extract_reference(page: Page) -> str:
@@ -660,7 +788,7 @@ def _extract_reference(page: Page) -> str:
 # ------------------------------------------------------------------
 
 
-def _accept_terms_inline(page: Page) -> None:
+def _accept_terms_inline(page: Page, deadline: Deadline) -> None:
     """Check the inline T&Cs checkbox on the checkout page (pre-pay step).
 
     Better's checkout page has a checkbox "I agree to the Terms and Conditions"
@@ -674,9 +802,9 @@ def _accept_terms_inline(page: Page) -> None:
     ]:
         try:
             cb = page.locator(selector).first
-            if cb.is_visible(timeout=2_000):
+            if cb.is_visible(timeout=deadline.remaining_ms(cap_ms=2_000)):
                 if not cb.is_checked():
-                    cb.check()
+                    cb.check(timeout=deadline.remaining_ms(cap_ms=2_000))
                     log.debug("T&Cs inline checkbox checked via %s", selector)
                 else:
                     log.debug("T&Cs inline checkbox already checked via %s", selector)
@@ -686,14 +814,14 @@ def _accept_terms_inline(page: Page) -> None:
     log.debug("T&Cs inline checkbox not found - may already be accepted")
 
 
-def _accept_terms(page: Page) -> None:
+def _accept_terms(page: Page, deadline: Deadline) -> None:
     """Click 'I Agree' on T&Cs modal, or check T&Cs checkbox if present."""
     # Modal with "I Agree" button (appears after clicking Continue)
     # We pre-click Continue then handle modal - but better to handle before.
     # The modal may appear on page load; try to dismiss it first.
     try:
         btn = page.locator('button:has-text("I Agree")').first
-        if btn.is_visible(timeout=3_000):
+        if btn.is_visible(timeout=deadline.remaining_ms(cap_ms=3_000)):
             # Scroll modal content to bottom so "I Agree" enables
             page.evaluate("""
                 () => {
@@ -708,8 +836,8 @@ def _accept_terms(page: Page) -> None:
                 }
             """)
             time.sleep(0.3)
-            btn.scroll_into_view_if_needed()
-            btn.click()
+            btn.scroll_into_view_if_needed(timeout=deadline.remaining_ms(cap_ms=3_000))
+            btn.click(timeout=deadline.remaining_ms(cap_ms=3_000))
             log.debug("T&Cs accepted via 'I Agree' button")
             time.sleep(0.5)
             return
@@ -723,8 +851,8 @@ def _accept_terms(page: Page) -> None:
     ]:
         try:
             cb = page.locator(selector).first
-            if cb.is_visible(timeout=1_000) and not cb.is_checked():
-                cb.check()
+            if cb.is_visible(timeout=deadline.remaining_ms(cap_ms=1_000)) and not cb.is_checked():
+                cb.check(timeout=deadline.remaining_ms(cap_ms=1_000))
                 log.debug("T&Cs accepted via %s", selector)
                 return
         except Exception:
