@@ -34,7 +34,7 @@ from better_bot.bot import (
     venue_today,
     watch_and_book,
 )
-from better_bot.checkout import CardDetails
+from better_bot.checkout import CardDetails, PaymentAmbiguousError
 
 # ------------------------------------------------------------------
 # load_config
@@ -595,11 +595,16 @@ def test_run_target_falls_back_to_polling_when_prearm_finds_nothing(tmp_path: Pa
 # ------------------------------------------------------------------
 
 
-def _bare_warmer() -> CheckoutWarmer:
+def _bare_warmer(session: object | None = None) -> CheckoutWarmer:
     """A CheckoutWarmer with its queues but no background thread - finish()
-    only touches _session_ready/_inbox/_outbox, so __init__ (which launches
-    a real Playwright session on a thread) doesn't need to run for these."""
+    only touches _session_ready/_inbox/_outbox/_session, so __init__ (which
+    launches a real Playwright session on a thread) doesn't need to run for
+    these. `session` mimics whatever open_checkout_session() would have
+    produced - None means pre-warm never got that far, same as __init__'s
+    own default before the background thread runs. Typed loosely (not a
+    real CheckoutSession) since only its .close() is exercised here."""
     warmer = CheckoutWarmer.__new__(CheckoutWarmer)
+    warmer._session = session  # ty: ignore[invalid-assignment]
     warmer._session_ready = threading.Event()
     warmer._session_ready.set()
     warmer._inbox = queue.Queue(maxsize=1)
@@ -620,12 +625,51 @@ def test_checkout_warmer_finish_reraises_a_real_checkout_error():
         warmer.finish(CardDetails(cvv="123"), timeout_s=0)
 
 
-def test_checkout_warmer_finish_times_out_with_a_clear_message(monkeypatch):
-    """Nothing ever lands in the outbox (the background thread is still
-    working, or genuinely stuck) - finish() used to let a bare queue.Empty
-    propagate, which stringifies to '' and produced a blank "Checkout
-    failed: " log/notification with no way to tell what happened."""
-    monkeypatch.setattr(CheckoutWarmer, "FINISH_PAD_S", 0)
+def test_checkout_warmer_finish_reraises_payment_ambiguous_error_unchanged():
+    """A PaymentAmbiguousError from run_checkout() (Pay was clicked, then
+    something failed) must pass through finish() exactly as-is - callers
+    (_finish_checkout) key off this exact exception type to decide never to
+    retry automatically."""
     warmer = _bare_warmer()
-    with pytest.raises(RuntimeError, match="may still be running unsupervised"):
+    warmer._outbox.put(("err", PaymentAmbiguousError("payment may have been submitted")))
+    with pytest.raises(PaymentAmbiguousError, match="payment may have been submitted"):
+        warmer.finish(CardDetails(cvv="123"), timeout_s=0)
+
+
+def test_checkout_warmer_finish_times_out_and_force_closes_session(monkeypatch):
+    """Nothing ever lands in the outbox (the background thread is
+    genuinely wedged, past even run_checkout()'s own internal deadline) -
+    finish() must not just describe the risk, it must actually try to stop
+    the browser, and it must raise PaymentAmbiguousError (not a plain
+    RuntimeError) so callers apply the same never-auto-retry handling as
+    any other payment-ambiguous failure."""
+    monkeypatch.setattr(CheckoutWarmer, "FINISH_PAD_S", 0)
+    closed = []
+    session = type("FakeSession", (), {"close": lambda self: closed.append(True)})()
+    warmer = _bare_warmer(session=session)
+    with pytest.raises(PaymentAmbiguousError, match="Forcibly closed the browser session"):
+        warmer.finish(CardDetails(cvv="123"), timeout_s=0)
+    assert closed == [True]
+
+
+def test_checkout_warmer_finish_timeout_reports_when_force_close_also_fails(monkeypatch):
+    monkeypatch.setattr(CheckoutWarmer, "FINISH_PAD_S", 0)
+
+    def _boom(self):
+        raise RuntimeError("browser already dead")
+
+    session = type("FakeSession", (), {"close": _boom})()
+    warmer = _bare_warmer(session=session)
+    with pytest.raises(PaymentAmbiguousError, match="ALSO failed"):
+        warmer.finish(CardDetails(cvv="123"), timeout_s=0)
+
+
+def test_checkout_warmer_finish_timeout_with_no_session_still_closes_cleanly(monkeypatch):
+    """Pre-warm itself never produced a session (open_checkout_session()
+    failed) - nothing to close, but this must still be reported as
+    payment-ambiguous, since run_checkout()/complete_checkout() may have
+    started a cold-start attempt on the background thread regardless."""
+    monkeypatch.setattr(CheckoutWarmer, "FINISH_PAD_S", 0)
+    warmer = _bare_warmer(session=None)
+    with pytest.raises(PaymentAmbiguousError, match="Forcibly closed the browser session"):
         warmer.finish(CardDetails(cvv="123"), timeout_s=0)

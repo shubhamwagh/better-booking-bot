@@ -74,6 +74,11 @@ ICON_CHECK = _svg('<circle cx="12" cy="12" r="9"/><path d="m9 12 2 2 4-4"/>', 15
 ICON_DASH = _svg('<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>', 15)
 ICON_X = _svg('<circle cx="12" cy="12" r="9"/><path d="m9.5 9.5 5 5m0-5-5 5"/>', 15)
 ICON_EYE = _svg('<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>', 15)
+ICON_WARNING = _svg(
+    '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/>'
+    '<path d="M12 9v4"/><path d="M12 17h.01"/>',
+    15,
+)
 
 STATUS_ICONS = {
     "booked": ICON_CHECK,
@@ -82,6 +87,7 @@ STATUS_ICONS = {
     "no_slot": ICON_DASH,
     "failed": ICON_X,
     "cancelled": ICON_X,
+    "payment_ambiguous": ICON_WARNING,
 }
 STATUS_LABELS = {
     "booked": "booked",
@@ -90,6 +96,7 @@ STATUS_LABELS = {
     "no_slot": "no slot found",
     "failed": "failed",
     "cancelled": "cancelled",
+    "payment_ambiguous": "payment may have been taken - check account/bank",
 }
 SECURED_STATUSES = {"booked", "booked_manually"}
 
@@ -331,6 +338,7 @@ button.danger:hover {{ background: var(--danger); color: #fff; border-color: var
 .history-status.no_slot {{ color: var(--muted); }}
 .history-status.failed {{ color: var(--danger); }}
 .history-status.cancelled {{ color: var(--danger); }}
+.history-status.payment_ambiguous {{ color: var(--danger); font-weight: 700; }}
 .log-box {{
   background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
   padding: 1rem; font-family: ui-monospace, monospace; font-size: 0.8rem; line-height: 1.5;
