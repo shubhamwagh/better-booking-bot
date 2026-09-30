@@ -167,6 +167,40 @@ def open_checkout_session(token: str, headless: bool = True) -> CheckoutSession:
     )
     # Hide navigator.webdriver to bypass Opayo bot detection
     context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    # Strip the OneTrust cookie-consent widget for the life of the page, not
+    # just once at load. A real incident traced a blocked click straight to
+    # this: OneTrust often renders its banner on its own delayed timer,
+    # independent of page-load/networkidle timing - a single one-shot
+    # removal right after navigation can win or lose that race depending on
+    # exactly when its script happens to run. A persistent MutationObserver
+    # (re-installed on every navigation, since init scripts run fresh each
+    # time) removes it the instant it *ever* appears, closing the race
+    # entirely instead of gambling on removing it before or after the fact.
+    context.add_init_script("""
+        (() => {
+            const KILL_SELECTORS = [
+                '#onetrust-consent-sdk',
+                '.onetrust-pc-dark-filter',
+                '#onetrust-banner-sdk',
+                '#onetrust-pc-sdk',
+            ];
+            const strip = () => {
+                for (const sel of KILL_SELECTORS) {
+                    document.querySelectorAll(sel).forEach((el) => el.remove());
+                }
+                if (document.body) document.body.style.overflow = '';
+            };
+            const start = () => {
+                strip();
+                new MutationObserver(strip).observe(document.documentElement, {
+                    childList: true,
+                    subtree: true,
+                });
+            };
+            if (document.documentElement) start();
+            else document.addEventListener('DOMContentLoaded', start);
+        })();
+    """)
     context.add_cookies(
         [
             {
@@ -185,7 +219,6 @@ def open_checkout_session(token: str, headless: bool = True) -> CheckoutSession:
 
     log.info("Pre-warming checkout page…")
     page.goto(f"{BOOKINGS_BASE}/basket/checkout", wait_until="networkidle", timeout=30_000)
-    _dismiss_cookie_banner(page)
     log.info("Checkout session warm and ready")
 
     return CheckoutSession(playwright=pw, browser=browser, context=context, page=page)
@@ -231,7 +264,6 @@ def run_checkout(session: CheckoutSession, card: CardDetails, timeout_s: int = 6
     page.goto(
         f"{BOOKINGS_BASE}/basket/checkout", wait_until="networkidle", timeout=deadline.remaining_ms(cap_ms=30_000)
     )
-    _dismiss_cookie_banner(page)
     time.sleep(2)
 
     # Step 1: apply any available credit
@@ -863,16 +895,3 @@ def _block_analytics(page: Page) -> None:
     # Block OneTrust cookie banner CDN only.
     # Do NOT block GTM - the Better SPA uses a GTM event to trigger Opayo initialization.
     page.route("**/cdn.cookielaw.org/**", lambda r: r.abort())
-
-
-def _dismiss_cookie_banner(page: Page) -> None:
-    try:
-        page.evaluate("""
-            () => {
-                const sdk = document.getElementById('onetrust-consent-sdk');
-                if (sdk) sdk.remove();
-                document.body.style.overflow = '';
-            }
-        """)
-    except Exception:
-        pass
